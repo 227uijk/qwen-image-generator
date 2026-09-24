@@ -476,15 +476,15 @@ function renderJob(s, ready) {
   }
 }
 
-// 模型常驻开关：不想占内存时点「释放内存」，想出图前先点「加载模型」
-const ENG = {off: ['加载模型', ''], loading: ['加载中… · 点此停止', 'busy'], ready: ['模型已加载 · 释放内存', 'ok']};
+// 模型常驻开关：要出图前点「加载模型」，不用了点「卸载」把内存还给系统（不会删文件）
+const ENG = {off: ['加载模型', ''], loading: ['加载中… · 点此取消', 'busy'], ready: ['模型已加载 · 点此卸载', 'ok']};
 function renderEngine(s) {
   const [txt, cls] = ENG[s.warm];
   $('engTxt').textContent = txt;
   $('engBtn').className = 'chip ' + cls;
   $('engBtn').dataset.state = s.warm;
   $('engBtn').disabled = s.job.running;
-  $('engBtn').title = s.job.running ? '生成中' : (s.warm === 'off' ? '提前把模型读进内存，出图时就不用等加载' : '关掉引擎，把模型占的内存还给系统');
+  $('engBtn').title = s.job.running ? '生成中' : (s.warm === 'off' ? '提前把模型读进内存，出图时就不用等加载' : '把模型从内存里卸掉（模型文件不会删）');
 }
 $('engBtn').onclick = async () => {
   reqErr = '';

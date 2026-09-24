@@ -476,7 +476,7 @@ def task_view():
 PROG = re.compile(r"\|\s*(\d+)/(\d+)\s*-\s*([\d.]+)(s/it|it/s)")
 ENGINE_PID = TMP / "engine.pid"
 eng_lock = threading.Lock()  # 同一时间只有一个线程在启动 / 使用引擎
-# want：用户想让模型常驻（点了「加载模型」或出过图），点「释放内存」后为 False
+# want：用户想让模型常驻（点了「加载模型」或出过图），点「卸载」后为 False
 eng = {"proc": None, "key": None, "port": None, "warming": False, "timer": None, "want": False}
 # 走本机回环，不能被系统代理截走
 local = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -729,7 +729,7 @@ def load_engine(lowmem):
 
 def unload_engine():
     if job["running"]:
-        raise ValueError("正在生成，先取消再释放")
+        raise ValueError("正在生成，先取消再卸载")
     eng["want"] = False
     t = eng.get("timer")
     if t:
