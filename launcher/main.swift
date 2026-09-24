@@ -2,7 +2,8 @@
 import Cocoa
 import WebKit
 
-let port = 7861
+// 和 app.py 一样读 QWEN_PORT，默认 7861
+let port = Int(ProcessInfo.processInfo.environment["QWEN_PORT"] ?? "") ?? 7861
 let url = URL(string: "http://127.0.0.1:\(port)/")!
 // .app 所在的目录就是工具根目录（app.py 在这里）
 let root = Bundle.main.bundleURL.deletingLastPathComponent()

@@ -310,6 +310,7 @@ const gb = b => b >= 1e9 ? (b / 1e9).toFixed(2) + ' GB' : (b / 1e6).toFixed(0) +
 const fmt = s => s >= 3600 ? `${Math.floor(s / 3600)} 时 ${Math.floor(s % 3600 / 60)} 分` : s >= 60 ? `${Math.floor(s / 60)} 分 ${s % 60} 秒` : `${s} 秒`;
 const esc = t => String(t).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
 let refData = null, current = null, lastOutput, jobSeen = false, history = [], firstPoll = true, meta = {roles: {}, presets: []};
+let reqErr = '';  // 提交被后台拒绝的原因，不能被轮询覆盖掉
 const speeds = {};  // 每个下载任务最近 30 秒的字节采样
 
 async function api(path, body) {
@@ -451,7 +452,7 @@ function renderJob(s, ready) {
   $('stage').textContent = stage;
   $('eta').textContent = j.running ? `${fmt(j.elapsed)}` + (j.eta != null ? ` · 剩 ${fmt(j.eta)}` : '') : '';
   $('prog').style.width = j.total ? (j.step / j.total * 100) + '%' : (j.running ? '3%' : '0');
-  $('genErr').textContent = j.error || '';
+  $('genErr').textContent = reqErr || j.error || '';
   $('badge').textContent = j.running ? `冲洗中 · ${stage}` : '';
   $('badge').classList.toggle('on', j.running);
   const log = $('log'), atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 5;
@@ -534,6 +535,9 @@ function setRef(dataUrl) {
 }
 function readFile(f) {
   if (!f) return;
+  reqErr = !f.type.startsWith('image/') || f.type === 'image/svg+xml' ? '参考图需要是 PNG / JPG 等图片文件' : '';
+  $('genErr').textContent = reqErr;
+  if (reqErr) return;
   const r = new FileReader();
   r.onload = () => setRef(r.result);
   r.readAsDataURL(f);
@@ -546,13 +550,14 @@ $('drop').ondrop = e => { e.preventDefault(); $('drop').classList.remove('over')
 
 $('go').onclick = async () => {
   if ($('go').classList.contains('cancel')) { await api('/api/cancel', {}); return poll(); }
+  reqErr = '';
   try {
     await api('/api/generate', {
       prompt: $('prompt').value, negative: $('negative').value, ref: refData,
       size: $('size').value, steps: +$('steps').value, cfg: +$('cfg').value,
-      seed: +$('seed').value, lowmem: $('lowmem').checked, fast: $('fast').checked,
+      seed: $('seed').value.trim() === '' ? -1 : +$('seed').value, lowmem: $('lowmem').checked, fast: $('fast').checked,
     });
-  } catch (e) { $('genErr').textContent = e.message; }
+  } catch (e) { reqErr = e.message; }
   poll();
 };
 

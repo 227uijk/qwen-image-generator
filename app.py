@@ -211,7 +211,7 @@ def load_history():
 
 
 def save_history(h):
-    save_json(HISTORY, h[-500:])
+    save_json(HISTORY, h)
 
 
 # ---------- 下载队列 ----------
@@ -327,8 +327,11 @@ def run_task(t):
             return
         if (size and have > size) or p.returncode == 33:  # 文件异常，或服务器不支持续传：从头下
             part.unlink(missing_ok=True)
-        if p.returncode == 22 and "404" in (err or ""):
-            update_task(t["id"], status="error", error="链接不存在（404）")
+        fatal = re.search(r"error: (401|403|404)", err or "") if p.returncode == 22 else None
+        if fatal:
+            code = fatal[1]
+            msg = {"404": "链接不存在（404）"}.get(code, f"没有访问权限（{code}），可能需要先在网页上同意模型协议")
+            update_task(t["id"], status="error", error=msg)
             return
         update_task(t["id"], error=(err or "").strip()[-200:] or f"curl 退出码 {p.returncode}，重试中…")
         time.sleep(5)
@@ -393,7 +396,9 @@ def add_download(url, role, name, source):
         entries = [(url, dest, None)]
     added = 0
     with dl_lock:
-        ts = tasks()
+        # 模型文件已被删掉的「已完成」任务不算数，否则预设没法重新下载
+        ts = [t for t in tasks() if not (t["status"] == "done" and t["dest"].startswith("models/")
+                                         and not dest_of(t).exists())]
         known = {t["dest"] for t in ts if t["status"] != "error"}
         for u, dest, size in entries:
             if dest in known:
@@ -524,6 +529,8 @@ def gen_worker(cmd, record):
         job["stage"] = "失败"
         job["error"] = str(e)
     finally:
+        if record["ref"]:  # 参考图只是临时文件，用完就删
+            (TMP / record["ref"]).unlink(missing_ok=True)
         job["running"] = False
         job["proc"] = None
 
@@ -632,6 +639,46 @@ def mlx_worker(req, record, pack):
         job["proc"] = None
 
 
+def parse_params(req):
+    """校验并解析生成参数；出错抛 ValueError，此时任务还没占用。"""
+    prompt = (req.get("prompt") or "").strip()
+    if not prompt:
+        raise ValueError("提示词不能为空")
+    try:
+        w, h = (int(x) for x in str(req.get("size") or "512x512").split("x"))
+        steps = max(1, min(80, int(req.get("steps") or 20)))
+        cfg = float(req.get("cfg") or 1.0)
+        seed = int(req.get("seed") if req.get("seed") is not None else -1)
+    except (TypeError, ValueError):
+        raise ValueError("参数格式不对，检查一下尺寸 / 步数 / CFG / 种子")
+    if seed < 0:
+        seed = int.from_bytes(os.urandom(4), "big") & 0x7FFFFFFF
+    return {"prompt": prompt, "negative": (req.get("negative") or "").strip(), "size": f"{w}x{h}",
+            "w": w, "h": h, "steps": steps, "cfg": cfg, "seed": seed}
+
+
+def decode_ref(ref):
+    """参考图 data URL → (扩展名, 字节)。只接受 base64 编码的位图。"""
+    m = re.match(r"data:image/([\w.+-]+);base64,(.*)", ref, re.S)
+    if not m or m[1] == "svg+xml":
+        raise ValueError("参考图需要是 PNG / JPG 等图片文件")
+    try:
+        data = base64.b64decode(m[2], validate=True)
+    except ValueError:
+        raise ValueError("参考图读取失败，换一张试试")
+    return {"jpeg": "jpg"}.get(m[1], m[1]), data
+
+
+def claim_job():
+    with lock:
+        if job["running"]:
+            return False
+        job.update(running=True, stage="启动中", step=0, total=0, spi=None, log=[], error=None,
+                   output=None, started=time.time(), cancelled=False)
+        job.pop("t_first", None)
+        return True
+
+
 def start_generate(req):
     exe = sd_cli()
     sel = selection()
@@ -642,52 +689,41 @@ def start_generate(req):
     missing = ([] if exe else ["sd.cpp 程序"]) + [ROLES[r] for r in need if not sel[r]]
     if missing:
         return "还缺：" + "、".join(missing) + "（点右上角「模型」下载）"
-    prompt = (req.get("prompt") or "").strip()
-    if not prompt:
-        return "提示词不能为空"
-    with lock:
-        if job["running"]:
-            return "已有任务在跑"
-        job.update(running=True, stage="启动中", step=0, total=0, spi=None, log=[], error=None,
-                   output=None, started=time.time(), cancelled=False)
-        job.pop("t_first", None)
-    w, h = (int(x) for x in req.get("size", "512x512").split("x"))
-    steps = max(1, min(80, int(req.get("steps", 20))))
-    cfg = float(req.get("cfg", 1.0))
-    seed = int(req.get("seed", -1))
-    if seed < 0:
-        seed = int.from_bytes(os.urandom(4), "big") & 0x7FFFFFFF
+    try:
+        prm = parse_params(req)
+        ref_img = decode_ref(ref) if ref else None
+    except ValueError as e:
+        return str(e)
+    if not claim_job():
+        return "已有任务在跑"
     stamp = time.strftime("%Y%m%d_%H%M%S")
     out = OUT / f"qwen_{stamp}.png"
     cmd = [str(exe),
            "--diffusion-model", str(MODELS / sel["dit"]),
            "--vae", str(MODELS / sel["vae"]),
            "--llm", str(MODELS / sel["te"]),
-           "-p", prompt,
-           "--cfg-scale", str(cfg), "--sampling-method", "euler",
-           "--steps", str(steps), "-W", str(w), "-H", str(h), "-s", str(seed),
+           "-p", prm["prompt"],
+           "--cfg-scale", str(prm["cfg"]), "--sampling-method", "euler",
+           "--steps", str(prm["steps"]), "-W", str(prm["w"]), "-H", str(prm["h"]), "-s", str(prm["seed"]),
            "--diffusion-fa", "-o", str(out), "-v",
            # Qwen 2.1 的 VAE 是 3D 卷积，M2 上 Metal 实现很慢，放 CPU 快 3 倍且结果一致
            "--backend", "vae=cpu"]
-    neg = (req.get("negative") or "").strip()
-    if neg:
-        cmd += ["-n", neg]
+    if prm["negative"]:
+        cmd += ["-n", prm["negative"]]
     if req.get("lowmem", True):
         cmd += ["--params-backend", "te=disk"]
     fast = bool(req.get("fast", False))
     if fast:  # EasyCache：相邻步变化小时跳过计算
         cmd += ["--cache-mode", "easycache"]
     ref_name = None
-    if ref:
-        m = re.match(r"data:image/(\w+);base64,(.*)", ref, re.S)
-        ext = {"jpeg": "jpg"}.get(m[1], m[1]) if m else "png"
-        ref_path = TMP / f"ref_{stamp}.{ext}"
-        ref_path.write_bytes(base64.b64decode(m[2] if m else ref))
+    if ref_img:
+        ref_path = TMP / f"ref_{stamp}.{ref_img[0]}"
+        ref_path.write_bytes(ref_img[1])
         ref_name = ref_path.name
         cmd += ["--llm_vision", str(MODELS / sel["vision"]), "-r", str(ref_path)]
-    record = {"file": str(out), "name": out.name, "prompt": prompt, "negative": neg, "size": f"{w}x{h}",
-              "steps": steps, "cfg": cfg, "seed": seed, "ref": ref_name, "fast": fast, "time": stamp,
-              "dit": Path(sel["dit"]).name, "te": Path(sel["te"]).name}
+    record = {"file": str(out), "name": out.name, "prompt": prm["prompt"], "negative": prm["negative"],
+              "size": prm["size"], "steps": prm["steps"], "cfg": prm["cfg"], "seed": prm["seed"], "ref": ref_name,
+              "fast": fast, "time": stamp, "dit": Path(sel["dit"]).name, "te": Path(sel["te"]).name}
     threading.Thread(target=gen_worker, args=(cmd, record), daemon=True).start()
     return None
 
@@ -698,24 +734,17 @@ def start_generate_mlx(req, sel):
         return "还缺：" + "、".join(missing) + "（点右上角「模型」下载「MLX 引擎套装」）"
     if req.get("ref"):
         return "MLX 引擎的 Qwen 2.1 暂不支持参考图编辑，请切回 sd.cpp 引擎"
-    prompt = (req.get("prompt") or "").strip()
-    if not prompt:
-        return "提示词不能为空"
-    with lock:
-        if job["running"]:
-            return "已有任务在跑"
-        job.update(running=True, stage="启动中", step=0, total=0, spi=None, log=[], error=None,
-                   output=None, started=time.time(), cancelled=False)
-        job.pop("t_first", None)
-    w, h = (int(x) for x in req.get("size", "512x512").split("x"))
-    seed = int(req.get("seed", -1))
-    if seed < 0:
-        seed = int.from_bytes(os.urandom(4), "big") & 0x7FFFFFFF
+    try:
+        prm = parse_params(req)
+    except ValueError as e:
+        return str(e)
+    if not claim_job():
+        return "已有任务在跑"
     stamp = time.strftime("%Y%m%d_%H%M%S")
     out = OUT / f"qwen_{stamp}.png"
-    record = {"file": str(out), "name": out.name, "prompt": prompt, "negative": (req.get("negative") or "").strip(),
-              "size": f"{w}x{h}", "steps": max(1, min(80, int(req.get("steps", 20)))), "cfg": float(req.get("cfg", 1.0)),
-              "seed": seed, "ref": None, "fast": False, "time": stamp, "engine": "mlx", "dit": Path(sel["mlx"]).name}
+    record = {"file": str(out), "name": out.name, "prompt": prm["prompt"], "negative": prm["negative"],
+              "size": prm["size"], "steps": prm["steps"], "cfg": prm["cfg"], "seed": prm["seed"], "ref": None,
+              "fast": False, "time": stamp, "engine": "mlx", "dit": Path(sel["mlx"]).name}
     threading.Thread(target=mlx_worker, args=(req, record, sel["mlx"]), daemon=True).start()
     return None
 
@@ -791,7 +820,15 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def trusted(self):
+        """挡住别的网站借用户浏览器调接口（CSRF）和 DNS rebinding：只认本机地址。"""
+        hosts = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
+        origin = self.headers.get("Origin")
+        return self.headers.get("Host") in hosts and (origin is None or origin in {f"http://{h}" for h in hosts})
+
     def do_GET(self):
+        if not self.trusted():
+            return self.send(403, {"error": "forbidden"})
         path = unquote(urlparse(self.path).path)
         if path == "/":
             return self.send(200, (ROOT / "index.html").read_bytes(), "text/html; charset=utf-8")
@@ -800,7 +837,7 @@ class H(BaseHTTPRequestHandler):
         if path == "/api/meta":
             return self.send(200, {"roles": ROLES, "presets": PRESETS})
         if path == "/api/history":
-            return self.send(200, [r for r in load_history() if Path(r["file"]).exists()][::-1])
+            return self.send(200, [r for r in load_history() if (OUT / r["name"]).exists()][::-1])
         for prefix, base in (("/outputs/", OUT), ("/tmp/", TMP)):
             if path.startswith(prefix):
                 f = inside(base, path[len(prefix):])
@@ -811,10 +848,12 @@ class H(BaseHTTPRequestHandler):
         self.send(404, {"error": "not found"})
 
     def do_POST(self):
-        n = int(self.headers.get("Content-Length") or 0)
-        req = json.loads(self.rfile.read(n) or b"{}")
+        if not self.trusted():
+            return self.send(403, {"error": "forbidden"})
         path = urlparse(self.path).path
         try:
+            n = int(self.headers.get("Content-Length") or 0)
+            req = json.loads(self.rfile.read(n) or b"{}")
             if path == "/api/generate":
                 err = start_generate(req)
                 if err:
