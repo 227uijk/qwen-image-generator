@@ -35,6 +35,7 @@
   .chip { display: inline-flex; align-items: center; gap: 7px; padding: 6px 12px; border-radius: 999px; border: 1px solid var(--line2);
           background: transparent; color: var(--ink); font: 500 12px var(--sans); cursor: pointer; }
   .chip:hover { border-color: var(--accent); }
+  .chip:disabled { opacity: .5; cursor: default; border-color: var(--line2); }
   .chip i { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
   .chip.ok i { background: var(--ok); } .chip.busy i { background: var(--accent); animation: pulse 1.2s infinite; }
   .chip.need i { background: var(--bad); }
@@ -186,6 +187,7 @@
       <span id="mem">内存 –</span>
       <span id="disk">磁盘 –</span>
     </div>
+    <button class="chip" id="engBtn"><i></i><span id="engTxt">加载模型</span></button>
     <button class="chip" id="modelsBtn"><i></i><span id="modelChip">模型</span></button>
     <button class="ghost" id="quit" title="关闭后台服务">退出</button>
   </header>
@@ -199,6 +201,8 @@
 
         <div class="sec"><span>参考图</span><span>放了就是图生图</span></div>
         <div class="drop" id="drop">点击或拖入一张图片<input type="file" id="file" accept="image/*" hidden></div>
+        <label class="toggle"><input type="checkbox" id="reflite">
+          <span>参考图快速模式<small>参考图按 1/4 像素参与计算，图生图更快、发热更少，但原图细节保留得差一些</small></span></label>
 
         <div class="sec"><span>模型</span><button class="ghost" id="manageBtn" style="padding:0;font:inherit;letter-spacing:0">管理 ›</button></div>
         <div class="seg" id="engineSeg">
@@ -456,7 +460,7 @@ function renderJob(s, ready) {
   if (j.total) stage += ` · ${j.step}/${j.total}`;
   if (j.spi) stage += ` · ${j.spi.toFixed(1)}s/步`;
   $('stage').textContent = stage;
-  $('eta').textContent = j.running ? `${fmt(j.elapsed)}` + (j.eta != null ? ` · 剩 ${fmt(j.eta)}` : '') : s.warm;
+  $('eta').textContent = j.running ? `${fmt(j.elapsed)}` + (j.eta != null ? ` · 剩 ${fmt(j.eta)}` : '') : '';
   $('prog').style.width = j.total ? (j.step / j.total * 100) + '%' : (j.running ? '3%' : '0');
   $('genErr').textContent = reqErr || j.error || '';
   $('badge').textContent = j.running ? `冲洗中 · ${stage}` : '';
@@ -472,6 +476,25 @@ function renderJob(s, ready) {
   }
 }
 
+// 模型常驻开关：不想占内存时点「释放内存」，想出图前先点「加载模型」
+const ENG = {off: ['加载模型', ''], loading: ['加载中… · 点此停止', 'busy'], ready: ['模型已加载 · 释放内存', 'ok']};
+function renderEngine(s) {
+  const [txt, cls] = ENG[s.warm];
+  $('engTxt').textContent = txt;
+  $('engBtn').className = 'chip ' + cls;
+  $('engBtn').dataset.state = s.warm;
+  $('engBtn').disabled = s.job.running;
+  $('engBtn').title = s.job.running ? '生成中' : (s.warm === 'off' ? '提前把模型读进内存，出图时就不用等加载' : '关掉引擎，把模型占的内存还给系统');
+}
+$('engBtn').onclick = async () => {
+  reqErr = '';
+  try {
+    if ($('engBtn').dataset.state === 'off') await api('/api/engine/load', {lowmem: $('lowmem').checked});
+    else await api('/api/engine/unload', {});
+  } catch (e) { reqErr = e.message; }
+  poll();
+};
+
 async function poll() {
   try {
     const s = await api('/api/status');
@@ -481,6 +504,7 @@ async function poll() {
     renderModels(s);
     renderTasks(s);
     renderJob(s, renderChip(s));
+    renderEngine(s);
   } catch (e) {
     $('stage').textContent = '后台服务已停止，重新打开「Qwen 生图」即可';
   }
@@ -510,7 +534,7 @@ function show(h) {
   $('infoPrompt').textContent = h.prompt;
   $('infoPrompt').classList.remove('open');
   $('infoMeta').textContent = `${h.size.replace('x', '×')} · ${h.steps}步 · CFG ${h.cfg}` + (h.seconds ? ` · ${fmt(h.seconds)}` : '')
-    + (h.fast ? ' · 加速' : '') + (h.ref ? ' · 图生图' : '') + (h.engine === 'mlx' ? ' · MLX' : '') + (h.dit ? ` · ${h.dit.replace(/\.(gguf|safetensors)$/, '')}` : '');
+    + (h.fast ? ' · 加速' : '') + (h.ref ? (h.reflite ? ' · 图生图（快速）' : ' · 图生图') : '') + (h.engine === 'mlx' ? ' · MLX' : '') + (h.dit ? ` · ${h.dit.replace(/\.(gguf|safetensors)$/, '')}` : '');
   $('infoMeta').title = `种子 ${h.seed}` + (h.te ? `\n文本编码器 ${h.te}` : '');
   $('history').querySelectorAll('img').forEach(img => {
     const on = history[img.dataset.i] === h;
@@ -562,6 +586,7 @@ $('go').onclick = async () => {
       prompt: $('prompt').value, negative: $('negative').value, ref: refData,
       size: $('size').value, steps: +$('steps').value, cfg: +$('cfg').value,
       seed: $('seed').value.trim() === '' ? -1 : +$('seed').value, lowmem: $('lowmem').checked, fast: $('fast').checked,
+      reflite: $('reflite').checked,
     });
   } catch (e) { reqErr = e.message; }
   poll();

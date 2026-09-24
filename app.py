@@ -476,7 +476,8 @@ def task_view():
 PROG = re.compile(r"\|\s*(\d+)/(\d+)\s*-\s*([\d.]+)(s/it|it/s)")
 ENGINE_PID = TMP / "engine.pid"
 eng_lock = threading.Lock()  # 同一时间只有一个线程在启动 / 使用引擎
-eng = {"proc": None, "key": None, "port": None, "warming": False, "timer": None}
+# want：用户想让模型常驻（点了「加载模型」或出过图），点「释放内存」后为 False
+eng = {"proc": None, "key": None, "port": None, "warming": False, "timer": None, "want": False}
 # 走本机回环，不能被系统代理截走
 local = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -690,7 +691,7 @@ def lock_engine():
 
 def preload():
     """把当前选中的模型提前加载进引擎；条件不满足时关掉引擎释放内存。"""
-    if dl_state.get("quitting"):
+    if dl_state.get("quitting") or not eng["want"]:
         return
     with eng_lock:
         try:
@@ -705,8 +706,8 @@ def preload():
             else:
                 stop_engine()
         except Exception as e:
-            if not job["running"]:
-                log_line(f"预载模型失败：{e}")
+            if eng["want"] and not job["running"]:
+                log_line(f"加载模型失败：{e}")
 
 
 def schedule_preload(delay=1.5):
@@ -719,10 +720,36 @@ def schedule_preload(delay=1.5):
     eng["timer"].start()
 
 
+def load_engine(lowmem):
+    if load_json(SETTINGS, {}).get("lowmem", True) != lowmem:
+        update_settings(lambda st: st.__setitem__("lowmem", lowmem))
+    eng["want"] = True
+    schedule_preload(0)
+
+
+def unload_engine():
+    if job["running"]:
+        raise ValueError("正在生成，先取消再释放")
+    eng["want"] = False
+    t = eng.get("timer")
+    if t:
+        t.cancel()
+    p = eng["proc"]
+    if p and p.poll() is None:  # 先杀进程，正在进行的预热会马上失败退出、让出锁
+        os.killpg(p.pid, signal.SIGTERM)
+
+    def clean():
+        with eng_lock:
+            if not eng["want"]:
+                stop_engine()
+    threading.Thread(target=clean, daemon=True).start()
+
+
 def warm_state():
-    if eng["warming"] or (eng_lock.locked() and not job["running"]):
-        return "模型预载中…"
-    return "模型已就绪" if eng_alive() else ""
+    """off 未加载 / loading 加载中 / ready 已就绪（给界面上的按钮用）"""
+    if eng["want"] and not job["running"] and (eng["warming"] or eng_lock.locked()):
+        return "loading"
+    return "ready" if eng_alive() else "off"
 
 
 def finish(record, b64=None):
@@ -740,13 +767,14 @@ def finish(record, b64=None):
 def fail(e):
     if job["cancelled"]:
         job["stage"] = "已取消"
-        schedule_preload()
+        schedule_preload()  # 引擎被关掉了，用户没点过释放就重新加载回来
     else:
         job["stage"] = "失败"
         job["error"] = str(e)
 
 
 def sd_worker(sel, lowmem, body, record):
+    eng["want"] = True
     try:
         lock_engine()
         try:
@@ -772,6 +800,7 @@ def sd_worker(sel, lowmem, body, record):
 
 def mlx_worker(record, pack):
     """用常驻的 MLX-Serve 流式生成一张图。"""
+    eng["want"] = True
     try:
         lock_engine()
         try:
@@ -900,9 +929,11 @@ def start_generate(req):
             "cache_mode": "easycache" if fast else "disabled"}
     if ref_img:
         body["ref_images"] = [base64.b64encode(ref_img[1]).decode()]
+        if req.get("reflite"):  # 参考图只按 1/4 像素进 DiT，序列短了每步快不少，代价是原图细节少些
+            body["ref_image_args"] = f"vae_input_max_pixels={prm['w'] * prm['h'] // 4}"
     record = {"file": str(out), "name": out.name, "prompt": prm["prompt"], "negative": prm["negative"],
               "size": prm["size"], "steps": prm["steps"], "cfg": prm["cfg"], "seed": prm["seed"], "ref": bool(ref_img),
-              "fast": fast, "time": stamp, "dit": Path(sel["dit"]).name, "te": Path(sel["te"]).name}
+              "reflite": bool(ref_img and req.get("reflite")), "fast": fast, "time": stamp, "dit": Path(sel["dit"]).name, "te": Path(sel["te"]).name}
     threading.Thread(target=sd_worker, args=(sel, lowmem, body, record), daemon=True).start()
     return None
 
@@ -1042,6 +1073,10 @@ class H(BaseHTTPRequestHandler):
                     return self.send(400, {"error": err})
             elif path == "/api/cancel":
                 cancel_generate()
+            elif path == "/api/engine/load":
+                load_engine(bool(req.get("lowmem", True)))
+            elif path == "/api/engine/unload":
+                unload_engine()
             elif path == "/api/dl/add":
                 items = req.get("items") or [{"url": req.get("url", ""), "role": req.get("role", "dit"),
                                               "name": req.get("name", "")}]
@@ -1054,7 +1089,7 @@ class H(BaseHTTPRequestHandler):
                 role, f = req.get("role"), req.get("file")
                 if role in ("dit", "te", "vae", "vision", "mlx", "engine"):
                     update_settings(lambda st: st.setdefault("sel", {}).__setitem__(role, f))
-                    schedule_preload()
+                    schedule_preload()  # 模型已加载着的话换成新选的
             elif path == "/api/model/role":
                 rel, role = req.get("file"), req.get("role")
                 if role in ROLES and inside(MODELS, rel):
@@ -1098,7 +1133,6 @@ def main():
     if any(t["status"] == "queued" for t in ts):
         kick_worker()
     kill_stale_engine()
-    schedule_preload(0)
     if os.environ.get("QWEN_NO_BROWSER") != "1":
         threading.Timer(0.5, webbrowser.open, args=(url,)).start()
     def on_term(*_):
