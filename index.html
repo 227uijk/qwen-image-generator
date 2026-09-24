@@ -379,7 +379,12 @@ function taskSpeed(t) {
   const span = (now - arr[0][0]) / 1000;
   return span >= 5 ? (t.have - arr[0][1]) / span : 0;
 }
+// 按下鼠标时暂停重绘队列，否则 1.5 秒一次的刷新会把按钮换掉、点击丢失
+let taskHold = false;
+$('taskList').onpointerdown = () => taskHold = true;
+document.addEventListener('pointerup', () => setTimeout(() => taskHold = false));
 function renderTasks(s) {
+  if (taskHold) return;
   const label = {queued: '排队中', downloading: '下载中', paused: '已暂停', done: '已完成', error: '出错'};
   $('taskList').innerHTML = s.tasks.length ? s.tasks.map(t => {
     const pct = t.size ? Math.min(100, t.have / t.size * 100) : 0;
@@ -444,7 +449,8 @@ function renderChip(s) {
 function renderJob(s, ready) {
   const j = s.job;
   $('go').disabled = !j.running && !ready;
-  $('go').innerHTML = j.running ? '取消' : (ready ? '生成<span class="kbd">⌘↩</span>' : '先下载模型');
+  const goHtml = j.running ? '取消' : (ready ? '生成<span class="kbd">⌘↩</span>' : '先下载模型');
+  if ($('go').innerHTML !== goHtml) $('go').innerHTML = goHtml;  // 每次都重写会吞掉正按下的点击
   $('go').classList.toggle('cancel', j.running);
   let stage = j.stage;
   if (j.total) stage += ` · ${j.step}/${j.total}`;

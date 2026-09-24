@@ -114,9 +114,9 @@ def system_proxy():
 def avail_mem_gb():
     try:
         out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+        page = int(re.search(r"page size of (\d+)", out).group(1))
     except Exception:
         return None
-    page = int(re.search(r"page size of (\d+)", out).group(1))
     vals = {k.strip(): int(v) for k, v in re.findall(r"^(.+?):\s+(\d+)\.$", out, re.M)}
     pages = sum(vals.get(k, 0) for k in ("Pages free", "Pages inactive", "Pages speculative", "Pages purgeable"))
     return round(pages * page / 2**30, 1)
@@ -312,6 +312,9 @@ def run_task(t):
     cmd = curl_base(proxy) + ["-C", "-", "--retry", "20", "--retry-delay", "3", "--retry-all-errors",
                               "-o", str(part), url]
     while True:
+        cur = next((x for x in tasks() if x["id"] == t["id"]), None)
+        if not cur or cur["status"] != "downloading":  # 重试等待期间被暂停或移除
+            return
         p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         dl_state["proc"] = p
         _, err = p.communicate()
@@ -394,6 +397,9 @@ def add_download(url, role, name, source):
             raise ValueError("没法从链接里看出文件名，请手动填写")
         dest = f"bin/{fname}" if role in ("engine", "mlx_engine") else f"models/{fname}"
         entries = [(url, dest, None)]
+    for _, dest, _ in entries:
+        if not inside(ROOT / dest.split("/")[0], dest.split("/", 1)[1]):
+            raise ValueError("文件路径不合法：" + dest)
     added = 0
     with dl_lock:
         # 模型文件已被删掉的「已完成」任务不算数，否则预设没法重新下载
@@ -472,6 +478,8 @@ def gen_worker(cmd, record):
         p = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                              start_new_session=True)
         job["proc"] = p
+        if job["cancelled"]:
+            os.killpg(p.pid, signal.SIGTERM)
         buf = b""
         while True:
             chunk = p.stdout.read1(4096)
@@ -750,9 +758,11 @@ def start_generate_mlx(req, sel):
 
 
 def cancel_generate():
+    if not job["running"]:
+        return
+    job["cancelled"] = True  # 进程还没起来时，由工作线程启动后自己检查
     p = job.get("proc")
     if p and p.poll() is None:
-        job["cancelled"] = True
         os.killpg(p.pid, signal.SIGTERM)
 
 
@@ -914,6 +924,11 @@ def main():
         kick_worker()
     if os.environ.get("QWEN_NO_BROWSER") != "1":
         threading.Timer(0.5, webbrowser.open, args=(url,)).start()
+    def on_term(*_):
+        stop_for_quit()
+        cancel_generate()
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, on_term)
     print("Qwen 生图已启动：", url, flush=True)
     srv.serve_forever()
 
