@@ -120,21 +120,6 @@
   ::-webkit-scrollbar { height: 8px; width: 8px; } ::-webkit-scrollbar-thumb { background: var(--line2); border-radius: 4px; }
   ::-webkit-scrollbar-track { background: transparent; }
 
-  /* ---------- 保留区涂抹 ---------- */
-  .keeprow { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 11.5px; color: var(--mute); }
-  .keeprow .ghost { padding: 2px 6px; }
-  .keeprow b { color: var(--ok); font-weight: 500; }
-  .painter { position: fixed; inset: 0; z-index: 30; background: rgba(10,9,8,.94); display: none; flex-direction: column;
-    align-items: center; justify-content: center; gap: 12px; padding: 16px; }
-  .painter.on { display: flex; }
-  .painter .wrap { position: relative; line-height: 0; }
-  .painter canvas { border-radius: 4px; }
-  #paintMask { position: absolute; inset: 0; opacity: .55; cursor: crosshair; touch-action: none; }
-  .painter .tools { display: flex; gap: 10px; align-items: center; color: var(--mute); font-size: 12.5px; flex-wrap: wrap; justify-content: center; }
-  .painter .tools input[type=range] { width: 120px; padding: 0; accent-color: var(--accent); }
-  .painter .tools .on { color: var(--accent-ink); background: var(--accent); }
-  .painter .done { background: var(--accent); color: var(--accent-ink); font-weight: 600; }
-
   /* ---------- 模型抽屉 ---------- */
   .scrim { position: fixed; inset: 0; background: rgba(0,0,0,.5); opacity: 0; pointer-events: none; transition: opacity .2s; z-index: 20; }
   .drawer { position: fixed; top: 0; right: 0; bottom: 0; width: 460px; background: var(--panel); border-left: 1px solid var(--line2);
@@ -216,7 +201,6 @@
 
         <div class="sec"><span>参考图</span><span>放了就是图生图</span></div>
         <div class="drop" id="drop">点击或拖入一张图片<input type="file" id="file" accept="image/*" hidden></div>
-        <div class="keeprow" id="keepRow" hidden></div>
 
         <div class="sec"><span>模型</span><button class="ghost" id="manageBtn" style="padding:0;font:inherit;letter-spacing:0">管理 ›</button></div>
         <div class="seg" id="engineSeg">
@@ -289,17 +273,6 @@
 </div>
 <div class="badge" id="badge"></div>
 
-<div class="painter" id="painter">
-  <div class="hint" style="margin:0">涂上的地方会原样保留，只改没涂的部分（按当前尺寸裁切）</div>
-  <div class="wrap"><canvas id="paintBase"></canvas><canvas id="paintMask"></canvas></div>
-  <div class="tools">
-    <button class="chip on" id="brushBtn">画笔</button><button class="chip" id="eraseBtn">橡皮</button>
-    <label>笔刷 <input type="range" id="brushSize" min="4" max="120" value="36"></label>
-    <button class="ghost" id="clearPaint">清空</button>
-    <button class="ghost" id="cancelPaint">取消</button>
-    <button class="chip done" id="donePaint">完成</button>
-  </div>
-</div>
 <div class="scrim" id="scrim"></div>
 <div class="drawer" id="drawer">
   <h3>模型管理 <button class="ghost" id="closeDrawer">关闭 ✕</button></h3>
@@ -352,7 +325,7 @@ async function api(path, body) {
 const drawer = open => document.body.classList.toggle('drawer-open', open);
 $('modelsBtn').onclick = $('manageBtn').onclick = () => drawer(true);
 $('closeDrawer').onclick = $('scrim').onclick = () => drawer(false);
-document.addEventListener('keydown', e => { if (e.key === 'Escape') { drawer(false); if ($('painter').classList.contains('on')) $('cancelPaint').click(); } });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') drawer(false); });
 
 // ---------- 模型选择 / 管理 ----------
 let lastModelsKey = '';
@@ -559,7 +532,7 @@ function show(h) {
   $('infoPrompt').textContent = h.prompt;
   $('infoPrompt').classList.remove('open');
   $('infoMeta').textContent = `${h.size.replace('x', '×')} · ${h.steps}步 · CFG ${h.cfg}` + (h.seconds ? ` · ${fmt(h.seconds)}` : '')
-    + (h.fast ? ' · 加速' : '') + (h.ref ? (h.keep ? ' · 图生图（保留区）' : ' · 图生图') : '') + (h.engine === 'mlx' ? ' · MLX' : '') + (h.dit ? ` · ${h.dit.replace(/\.(gguf|safetensors)$/, '')}` : '');
+    + (h.fast ? ' · 加速' : '') + (h.ref ? ' · 图生图' : '') + (h.engine === 'mlx' ? ' · MLX' : '') + (h.dit ? ` · ${h.dit.replace(/\.(gguf|safetensors)$/, '')}` : '');
   $('infoMeta').title = `种子 ${h.seed}` + (h.te ? `\n文本编码器 ${h.te}` : '');
   $('history').querySelectorAll('img').forEach(img => {
     const on = history[img.dataset.i] === h;
@@ -582,8 +555,6 @@ $('delImg').onclick = deleteCurrent;
 // ---------- 参考图 ----------
 function setRef(dataUrl) {
   refData = dataUrl;
-  keep = null;
-  renderKeep();
   $('drop').innerHTML = dataUrl
     ? `<img src="${dataUrl}"><button class="ghost x" id="rmRef">移除</button>`
     : '点击或拖入一张图片<input type="file" id="file" accept="image/*" hidden>';
@@ -605,128 +576,12 @@ $('drop').ondragover = e => { e.preventDefault(); $('drop').classList.add('over'
 $('drop').ondragleave = () => $('drop').classList.remove('over');
 $('drop').ondrop = e => { e.preventDefault(); $('drop').classList.remove('over'); readFile(e.dataTransfer.files[0]); };
 
-// ---------- 保留区：涂上的地方不变 ----------
-// keep = {size, base: 按输出尺寸裁好的原图 canvas, mask: 同尺寸 canvas，白色笔迹 = 保留}
-let keep = null, painting = null;
-function renderKeep() {
-  const row = $('keepRow');
-  row.hidden = !refData;
-  if (!refData) return;
-  row.innerHTML = keep ? '<b>● 已涂保留区</b><button class="ghost" id="editKeep">修改</button><button class="ghost" id="rmKeep">清除</button>'
-                       : '想让某些地方完全不变？<button class="ghost" id="editKeep">涂保留区</button>';
-  $('editKeep').onclick = openPainter;
-  if (keep) $('rmKeep').onclick = () => { keep = null; renderKeep(); };
-}
-function loadImg(src) {
-  return new Promise((ok, bad) => { const i = new Image(); i.onload = () => ok(i); i.onerror = bad; i.src = src; });
-}
-function canvasOf(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
-async function openPainter() {
-  const [w, h] = $('size').value.split('x').map(Number);
-  if (!keep || keep.size !== $('size').value) {
-    // 居中裁成输出比例（和最终出图的构图一致）
-    const img = await loadImg(refData), base = canvasOf(w, h);
-    const sc = Math.max(w / img.naturalWidth, h / img.naturalHeight);
-    const dw = img.naturalWidth * sc, dh = img.naturalHeight * sc;
-    base.getContext('2d').drawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh);
-    keep = {size: $('size').value, base, mask: canvasOf(w, h), painted: false};
-  }
-  const pb = $('paintBase'), pm = $('paintMask');
-  pb.width = pm.width = w; pb.height = pm.height = h;
-  pb.getContext('2d').drawImage(keep.base, 0, 0);
-  const mctx = pm.getContext('2d');
-  mctx.clearRect(0, 0, w, h);
-  mctx.drawImage(tint(keep.mask, '#e9a23b'), 0, 0);
-  // 按窗口大小缩放显示，内部分辨率保持输出尺寸
-  const scale = Math.min((innerWidth - 40) / w, (innerHeight - 140) / h, 1.6);
-  [pb, pm].forEach(c => { c.style.width = w * scale + 'px'; c.style.height = h * scale + 'px'; });
-  painting = {scale, erase: false};
-  setTool(false);
-  $('painter').classList.add('on');
-}
-function tint(src, color) {  // 把白色笔迹换成指定颜色，透明处保持透明
-  const c = canvasOf(src.width, src.height), x = c.getContext('2d');
-  x.drawImage(src, 0, 0); x.globalCompositeOperation = 'source-in'; x.fillStyle = color; x.fillRect(0, 0, c.width, c.height);
-  return c;
-}
-function setTool(erase) {
-  painting.erase = erase;
-  $('brushBtn').classList.toggle('on', !erase); $('eraseBtn').classList.toggle('on', erase);
-}
-$('brushBtn').onclick = () => setTool(false);
-$('eraseBtn').onclick = () => setTool(true);
-$('clearPaint').onclick = () => { const pm = $('paintMask'); pm.getContext('2d').clearRect(0, 0, pm.width, pm.height); };
-$('cancelPaint').onclick = () => { $('painter').classList.remove('on'); if (keep && !keep.painted) keep = null; renderKeep(); };
-$('donePaint').onclick = () => {
-  const pm = $('paintMask'), m = keep.mask, x = m.getContext('2d');
-  x.clearRect(0, 0, m.width, m.height);
-  x.drawImage(tint(pm, '#fff'), 0, 0);
-  const a = x.getImageData(0, 0, m.width, m.height).data;
-  keep.painted = a.some((v, i) => i % 4 === 3 && v > 0);
-  if (!keep.painted) keep = null;
-  $('painter').classList.remove('on');
-  renderKeep();
-};
-(() => {
-  const pm = $('paintMask');
-  let last = null;
-  const pt = e => { const r = pm.getBoundingClientRect(); return [(e.clientX - r.left) / painting.scale, (e.clientY - r.top) / painting.scale]; };
-  const stroke = (a, b) => {
-    const x = pm.getContext('2d');
-    x.globalCompositeOperation = painting.erase ? 'destination-out' : 'source-over';
-    x.strokeStyle = x.fillStyle = '#e9a23b';
-    x.lineWidth = +$('brushSize').value; x.lineCap = x.lineJoin = 'round';
-    x.beginPath(); x.moveTo(...a); x.lineTo(...b); x.stroke();
-  };
-  pm.onpointerdown = e => { pm.setPointerCapture(e.pointerId); last = pt(e); stroke(last, last); };
-  pm.onpointermove = e => { if (!last) return; const p = pt(e); stroke(last, p); last = p; };
-  pm.onpointerup = pm.onpointercancel = () => { last = null; };
-})();
-$('size').addEventListener('change', () => {
-  if (keep) { keep = null; renderKeep(); reqErr = '尺寸改了，保留区已清空，请重新涂'; $('genErr').textContent = reqErr; }
-});
-function keepPayload() {
-  const {base, mask} = keep, w = mask.width, h = mask.height;
-  const src = mask.getContext('2d').getImageData(0, 0, w, h).data;
-  const hard = new Uint8ClampedArray(w * h);
-  for (let i = 0; i < w * h; i++) hard[i] = src[i * 4 + 3] > 127 ? 255 : 0;
-  // 贴回用的羽化边：盒式模糊两遍，让保留区和新画的部分过渡自然
-  let soft = hard, r = 3;
-  for (let pass = 0; pass < 2; pass++) {
-    const tmp = new Uint8ClampedArray(w * h), out = new Uint8ClampedArray(w * h);
-    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-      let s = 0, n = 0;
-      for (let k = -r; k <= r; k++) { const xx = x + k; if (xx >= 0 && xx < w) { s += soft[y * w + xx]; n++; } }
-      tmp[y * w + x] = s / n;
-    }
-    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-      let s = 0, n = 0;
-      for (let k = -r; k <= r; k++) { const yy = y + k; if (yy >= 0 && yy < h) { s += tmp[yy * w + x]; n++; } }
-      out[y * w + x] = s / n;
-    }
-    soft = out;
-  }
-  for (let i = 0; i < w * h; i++) soft[i] = Math.max(soft[i], hard[i]);  // 只往外羽化，涂到的像素保持 100% 原图
-  const gray = (vals, invert) => {
-    const c = canvasOf(w, h), x = c.getContext('2d'), d = x.createImageData(w, h);
-    for (let i = 0; i < w * h; i++) {
-      const v = invert ? 255 - vals[i] : vals[i];
-      d.data[i * 4] = d.data[i * 4 + 1] = d.data[i * 4 + 2] = v; d.data[i * 4 + 3] = 255;
-    }
-    x.putImageData(d, 0, 0);
-    return c.toDataURL('image/png');
-  };
-  // 引擎的蒙版：白 = 重画，黑 = 不动；贴回用 alpha：白 = 保留
-  return {image: base.toDataURL('image/png'), mask: gray(hard, true), alpha: gray(soft, false)};
-}
-
 $('go').onclick = async () => {
   if ($('go').classList.contains('cancel')) { await api('/api/cancel', {}); return poll(); }
   reqErr = '';
   try {
     await api('/api/generate', {
-      prompt: $('prompt').value, negative: $('negative').value,
-      ...(keep ? (k => ({ref: k.image, keep: k}))(keepPayload()) : {ref: refData}),
+      prompt: $('prompt').value, negative: $('negative').value, ref: refData,
       size: $('size').value, steps: +$('steps').value, cfg: +$('cfg').value,
       seed: $('seed').value.trim() === '' ? -1 : +$('seed').value, lowmem: $('lowmem').checked, fast: $('fast').checked,
     });

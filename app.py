@@ -14,7 +14,6 @@ import time
 import urllib.request
 import uuid
 import webbrowser
-import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -136,89 +135,6 @@ def mlx_serve():
         if p.is_file() and os.access(p, os.X_OK):
             return p
     return None
-
-
-# ---------- PNG（只用标准库，给「保留区」贴回原图用） ----------
-
-def png_read(data):
-    """解码 8 位、非隔行的 PNG → (宽, 高, 通道数, 像素 bytearray, 要保留的文字块)。"""
-    if data[:8] != b"\x89PNG\r\n\x1a\n":
-        raise ValueError("不是 PNG")
-    pos, idat, text = 8, [], []
-    while pos < len(data):
-        n = int.from_bytes(data[pos:pos + 4], "big")
-        kind, body = data[pos + 4:pos + 8], data[pos + 8:pos + 8 + n]
-        pos += 12 + n
-        if kind == b"IHDR":
-            w, h = int.from_bytes(body[:4], "big"), int.from_bytes(body[4:8], "big")
-            depth, ctype, interlace = body[8], body[9], body[12]
-        elif kind == b"IDAT":
-            idat.append(body)
-        elif kind in (b"tEXt", b"iTXt", b"zTXt"):
-            text.append((kind, body))
-    ch = {0: 1, 2: 3, 4: 2, 6: 4}.get(ctype)
-    if depth != 8 or interlace or not ch:
-        raise ValueError("不支持的 PNG 格式")
-    raw = zlib.decompress(b"".join(idat))
-    stride = w * ch
-    out = bytearray(h * stride)
-    prev = bytearray(stride)
-    i = 0
-    for y in range(h):
-        f = raw[i]
-        line = bytearray(raw[i + 1:i + 1 + stride])
-        i += 1 + stride
-        if f == 1:
-            for x in range(ch, stride):
-                line[x] = (line[x] + line[x - ch]) & 255
-        elif f == 2:
-            line = bytearray((a + b) & 255 for a, b in zip(line, prev))
-        elif f == 3:
-            for x in range(stride):
-                left = line[x - ch] if x >= ch else 0
-                line[x] = (line[x] + ((left + prev[x]) >> 1)) & 255
-        elif f == 4:
-            for x in range(stride):
-                a = line[x - ch] if x >= ch else 0
-                b = prev[x]
-                c = prev[x - ch] if x >= ch else 0
-                p = a + b - c
-                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
-                line[x] = (line[x] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 255
-        out[y * stride:(y + 1) * stride] = line
-        prev = line
-    return w, h, ch, out, text
-
-
-def png_write(w, h, ch, px, text=()):
-    def chunk(kind, body):
-        return len(body).to_bytes(4, "big") + kind + body + zlib.crc32(kind + body).to_bytes(4, "big")
-    stride = w * ch
-    raw = b"".join(b"\0" + bytes(px[y * stride:(y + 1) * stride]) for y in range(h))
-    ihdr = w.to_bytes(4, "big") + h.to_bytes(4, "big") + bytes([8, {1: 0, 2: 4, 3: 2, 4: 6}[ch], 0, 0, 0])
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + b"".join(chunk(k, b) for k, b in text)
-            + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b""))
-
-
-def paste_keep(gen, orig, alpha):
-    """把原图按保留区（alpha 白 = 保留，边缘是羽化过的灰）贴回生成结果，保留区一个像素都不变。"""
-    w, h, ch, out, text = png_read(gen)
-    ow, oh, och, src, _ = png_read(orig)
-    aw, ah, ach, msk, _ = png_read(alpha)
-    if (ow, oh) != (w, h) or (aw, ah) != (w, h):
-        raise ValueError("保留区尺寸和结果不一致")
-    n = min(ch, och)
-    for i in range(w * h):
-        k = msk[i * ach]
-        if not k:
-            continue
-        o, s = i * ch, i * och
-        if k == 255:
-            out[o:o + n] = src[s:s + n]
-        else:
-            for c in range(n):
-                out[o + c] = (src[s + c] * k + out[o + c] * (255 - k) + 127) // 255
-    return png_write(w, h, ch, out, text)
 
 
 # ---------- 模型清单与选择 ----------
@@ -857,7 +773,7 @@ def fail(e):
         job["error"] = str(e)
 
 
-def sd_worker(sel, lowmem, body, record, keep=None):
+def sd_worker(sel, lowmem, body, record):
     eng["want"] = True
     try:
         lock_engine()
@@ -872,13 +788,6 @@ def sd_worker(sel, lowmem, body, record, keep=None):
             b64 = run_sd_job(body)
         finally:
             eng_lock.release()
-        if keep:
-            # 引擎只在潜空间里保留，经过 VAE 还是会有细微变化，这里用原图像素把保留区原样贴回去
-            job["stage"] = "贴回保留区"
-            try:
-                b64 = base64.b64encode(paste_keep(base64.b64decode(b64), keep["image"], keep["alpha"])).decode()
-            except Exception as e:
-                log_line(f"贴回保留区失败，保存未贴回的结果：{e}")
         finish(record, b64)
     except Exception as e:
         fail(e)
@@ -999,14 +908,9 @@ def start_generate(req):
     missing = ([] if exe else ["sd.cpp 程序"]) + [ROLES[r] for r in need if not sel[r]]
     if missing:
         return "还缺：" + "、".join(missing) + "（点右上角「模型」下载）"
-    keep = req.get("keep")  # 保留区：image 按输出尺寸裁好的原图，mask 给引擎（黑 = 不动），alpha 贴回用（白 = 保留）
     try:
         prm = parse_params(req)
         ref_img = decode_ref(ref) if ref else None
-        if keep:
-            keep = {k: decode_ref(keep.get(k) or "")[1] for k in ("image", "mask", "alpha")}
-            if not ref_img:
-                raise ValueError("保留区需要配合参考图使用")
     except ValueError as e:
         return str(e)
     if not claim_job():
@@ -1025,13 +929,10 @@ def start_generate(req):
             "cache_mode": "easycache" if fast else "disabled"}
     if ref_img:
         body["ref_images"] = [base64.b64encode(ref_img[1]).decode()]
-    if keep:  # 从原图出发，只重画没涂的地方；strength 默认 0.75，要重画的部分得完全重来
-        body.update(init_image=base64.b64encode(keep["image"]).decode(),
-                    mask_image=base64.b64encode(keep["mask"]).decode(), strength=1.0)
     record = {"file": str(out), "name": out.name, "prompt": prm["prompt"], "negative": prm["negative"],
               "size": prm["size"], "steps": prm["steps"], "cfg": prm["cfg"], "seed": prm["seed"], "ref": bool(ref_img),
-              "keep": bool(keep), "fast": fast, "time": stamp, "dit": Path(sel["dit"]).name, "te": Path(sel["te"]).name}
-    threading.Thread(target=sd_worker, args=(sel, lowmem, body, record, keep), daemon=True).start()
+              "fast": fast, "time": stamp, "dit": Path(sel["dit"]).name, "te": Path(sel["te"]).name}
+    threading.Thread(target=sd_worker, args=(sel, lowmem, body, record), daemon=True).start()
     return None
 
 
