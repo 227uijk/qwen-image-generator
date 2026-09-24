@@ -929,11 +929,9 @@ def start_generate(req):
             "cache_mode": "easycache" if fast else "disabled"}
     if ref_img:
         body["ref_images"] = [base64.b64encode(ref_img[1]).decode()]
-        if req.get("reflite"):  # 参考图只按 1/4 像素进 DiT，序列短了每步快不少，代价是原图细节少些
-            body["ref_image_args"] = f"vae_input_max_pixels={prm['w'] * prm['h'] // 4}"
     record = {"file": str(out), "name": out.name, "prompt": prm["prompt"], "negative": prm["negative"],
               "size": prm["size"], "steps": prm["steps"], "cfg": prm["cfg"], "seed": prm["seed"], "ref": bool(ref_img),
-              "reflite": bool(ref_img and req.get("reflite")), "fast": fast, "time": stamp, "dit": Path(sel["dit"]).name, "te": Path(sel["te"]).name}
+              "fast": fast, "time": stamp, "dit": Path(sel["dit"]).name, "te": Path(sel["te"]).name}
     threading.Thread(target=sd_worker, args=(sel, lowmem, body, record), daemon=True).start()
     return None
 

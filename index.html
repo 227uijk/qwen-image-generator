@@ -201,8 +201,6 @@
 
         <div class="sec"><span>参考图</span><span>放了就是图生图</span></div>
         <div class="drop" id="drop">点击或拖入一张图片<input type="file" id="file" accept="image/*" hidden></div>
-        <label class="toggle"><input type="checkbox" id="reflite">
-          <span>参考图快速模式<small>参考图按 1/4 像素参与计算，图生图更快、发热更少，但原图细节保留得差一些</small></span></label>
 
         <div class="sec"><span>模型</span><button class="ghost" id="manageBtn" style="padding:0;font:inherit;letter-spacing:0">管理 ›</button></div>
         <div class="seg" id="engineSeg">
@@ -534,7 +532,7 @@ function show(h) {
   $('infoPrompt').textContent = h.prompt;
   $('infoPrompt').classList.remove('open');
   $('infoMeta').textContent = `${h.size.replace('x', '×')} · ${h.steps}步 · CFG ${h.cfg}` + (h.seconds ? ` · ${fmt(h.seconds)}` : '')
-    + (h.fast ? ' · 加速' : '') + (h.ref ? (h.reflite ? ' · 图生图（快速）' : ' · 图生图') : '') + (h.engine === 'mlx' ? ' · MLX' : '') + (h.dit ? ` · ${h.dit.replace(/\.(gguf|safetensors)$/, '')}` : '');
+    + (h.fast ? ' · 加速' : '') + (h.ref ? ' · 图生图' : '') + (h.engine === 'mlx' ? ' · MLX' : '') + (h.dit ? ` · ${h.dit.replace(/\.(gguf|safetensors)$/, '')}` : '');
   $('infoMeta').title = `种子 ${h.seed}` + (h.te ? `\n文本编码器 ${h.te}` : '');
   $('history').querySelectorAll('img').forEach(img => {
     const on = history[img.dataset.i] === h;
@@ -586,7 +584,6 @@ $('go').onclick = async () => {
       prompt: $('prompt').value, negative: $('negative').value, ref: refData,
       size: $('size').value, steps: +$('steps').value, cfg: +$('cfg').value,
       seed: $('seed').value.trim() === '' ? -1 : +$('seed').value, lowmem: $('lowmem').checked, fast: $('fast').checked,
-      reflite: $('reflite').checked,
     });
   } catch (e) { reqErr = e.message; }
   poll();
