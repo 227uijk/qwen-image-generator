@@ -1,0 +1,592 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Qwen 生图</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #121110; --panel: #1a1917; --panel2: #221f1c; --line: #2f2b27; --line2: #3b3631;
+    --ink: #ede6da; --mute: #8f877b; --faint: #5f584f;
+    --accent: #e9a23b; --accent-soft: rgba(233, 162, 59, .13); --accent-ink: #1b1305;
+    --bad: #e5654f; --ok: #93c27f;
+    --serif: "New York", "Songti SC", "STSong", ui-serif, Georgia, serif;
+    --sans: -apple-system, "PingFang SC", "Hiragino Sans GB", sans-serif;
+    --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 13px/1.5 var(--sans);
+         overflow: hidden; -webkit-font-smoothing: antialiased; }
+  /* 胶片颗粒 */
+  body::after { content: ""; position: fixed; inset: 0; pointer-events: none; opacity: .05; z-index: 100;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E"); }
+
+  .app { height: 100vh; display: grid; grid-template-rows: 52px 1fr; }
+
+  /* ---------- 顶栏 ---------- */
+  header { display: flex; align-items: center; gap: 18px; padding: 0 20px; border-bottom: 1px solid var(--line); }
+  .brand { font: 600 17px/1 var(--serif); letter-spacing: .01em; }
+  .brand em { font-style: normal; color: var(--accent); }
+  .brand small { font: 500 11px var(--mono); color: var(--faint); margin-left: 8px; letter-spacing: .06em; }
+  .meta { margin-left: auto; display: flex; gap: 16px; align-items: center; color: var(--mute); font: 12px var(--mono); }
+  .meta b { color: var(--ink); font-weight: 500; }
+  .meta b.warn { color: var(--accent); }
+  .chip { display: inline-flex; align-items: center; gap: 7px; padding: 6px 12px; border-radius: 999px; border: 1px solid var(--line2);
+          background: transparent; color: var(--ink); font: 500 12px var(--sans); cursor: pointer; }
+  .chip:hover { border-color: var(--accent); }
+  .chip i { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
+  .chip.ok i { background: var(--ok); } .chip.busy i { background: var(--accent); animation: pulse 1.2s infinite; }
+  .chip.need i { background: var(--bad); }
+  @keyframes pulse { 50% { opacity: .3; } }
+  .ghost { background: none; border: 0; color: var(--mute); font: 12px var(--sans); cursor: pointer; padding: 4px 6px; border-radius: 6px; }
+  .ghost:hover { color: var(--ink); background: var(--panel2); }
+
+  main { display: grid; grid-template-columns: 340px minmax(0, 1fr); min-height: 0; }
+
+  /* ---------- 左栏：创作参数 ---------- */
+  aside { border-right: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; background: var(--panel); }
+  .form { flex: 1; overflow: auto; padding: 18px 18px 8px; }
+  .sec { font: 600 10.5px var(--mono); letter-spacing: .14em; color: var(--faint); text-transform: uppercase;
+         margin: 18px 0 8px; display: flex; justify-content: space-between; }
+  .sec:first-child { margin-top: 0; }
+  textarea, input, select { width: 100%; font: 13px/1.55 var(--sans); color: var(--ink); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; transition: border-color .15s; }
+  textarea { resize: vertical; min-height: 150px; }
+  textarea:focus, input:focus, select:focus { outline: none; border-color: var(--accent); }
+  input::placeholder, textarea::placeholder { color: var(--faint); }
+  select { appearance: none; -webkit-appearance: none; padding-right: 26px; cursor: pointer;
+    background: var(--bg) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%238f877b' fill='none' stroke-width='1.4'/%3E%3C/svg%3E") no-repeat right 10px center; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 10px; }
+  .field label { display: block; font-size: 11.5px; color: var(--mute); margin-bottom: 4px; }
+  .drop { border: 1px dashed var(--line2); border-radius: 8px; padding: 12px; text-align: center; color: var(--mute);
+          cursor: pointer; font-size: 12px; position: relative; transition: all .15s; }
+  .drop:hover, .drop.over { border-color: var(--accent); color: var(--ink); background: var(--accent-soft); }
+  .drop img { max-width: 100%; max-height: 140px; border-radius: 5px; display: block; margin: 0 auto; }
+  .drop .x { position: absolute; top: 6px; right: 6px; background: rgba(0,0,0,.6); }
+  .toggle { display: flex; gap: 9px; align-items: flex-start; margin-top: 9px; cursor: pointer; font-size: 12.5px; }
+  .toggle input { width: 14px; height: 14px; margin: 2px 0 0; accent-color: var(--accent); flex: none; }
+  .toggle span small { display: block; color: var(--faint); font-size: 11px; }
+
+  .dock { border-top: 1px solid var(--line); padding: 14px 18px 16px; background: var(--panel); }
+  #go { width: 100%; border: 0; border-radius: 9px; padding: 12px; cursor: pointer; font: 600 14px var(--sans);
+        background: var(--accent); color: var(--accent-ink); letter-spacing: .04em;
+        box-shadow: 0 0 0 1px rgba(233,162,59,.3), 0 8px 24px -10px rgba(233,162,59,.55); transition: transform .1s, filter .15s; }
+  #go:hover:not(:disabled) { filter: brightness(1.07); } #go:active:not(:disabled) { transform: translateY(1px); }
+  #go:disabled { opacity: .4; cursor: not-allowed; box-shadow: none; }
+  #go.cancel { background: transparent; color: var(--bad); box-shadow: inset 0 0 0 1px var(--bad); }
+  .kbd { font: 10.5px var(--mono); opacity: .55; margin-left: 6px; }
+  .status { display: flex; justify-content: space-between; margin-top: 11px; font: 11.5px var(--mono); color: var(--mute); }
+  .bar { height: 3px; background: var(--line); border-radius: 2px; overflow: hidden; margin-top: 6px; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .6s; }
+  .err { color: var(--bad); white-space: pre-wrap; font: 11px var(--mono); margin-top: 8px; max-height: 90px; overflow: auto; }
+  details summary { cursor: pointer; color: var(--faint); font-size: 11.5px; margin-top: 10px; list-style: none; }
+  details summary::before { content: "▸ "; } details[open] summary::before { content: "▾ "; }
+  pre.log { max-height: 160px; overflow: auto; font: 10.5px/1.45 var(--mono); color: var(--mute); background: var(--bg);
+            padding: 8px; border-radius: 6px; white-space: pre-wrap; margin: 6px 0 0; }
+
+  /* ---------- 右侧：画面 + 胶片条 ---------- */
+  .work { display: grid; grid-template-rows: minmax(0, 1fr) auto 118px; grid-template-columns: minmax(0, 1fr); min-height: 0; min-width: 0; }
+  .stage { position: relative; min-height: 0; display: flex; align-items: center; justify-content: center; padding: 52px 22px 22px;
+    background: radial-gradient(ellipse at 50% 40%, #1d1b18 0%, var(--bg) 70%); }
+  .stage img { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 3px;
+    box-shadow: 0 30px 60px -20px rgba(0,0,0,.8), 0 0 0 1px rgba(255,255,255,.04); animation: develop .6s ease-out; }
+  @keyframes develop { from { opacity: 0; filter: brightness(1.8) saturate(0); } to { opacity: 1; filter: none; } }
+  .empty { text-align: center; color: var(--faint); }
+  .empty .big { font: 400 26px var(--serif); color: var(--mute); margin-bottom: 6px; }
+  .badge { position: fixed; top: 64px; white-space: nowrap; left: calc(340px + (100vw - 340px) / 2); transform: translateX(-50%); padding: 6px 14px;
+    border-radius: 999px; background: rgba(18,17,16,.82); border: 1px solid var(--line2); font: 12px var(--mono); color: var(--accent);
+    backdrop-filter: blur(6px); display: none; z-index: 5; }
+  .badge.on { display: block; }
+
+  .info { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 2px 14px; padding: 10px 20px 8px;
+          border-top: 1px solid var(--line); }
+  .info .p { grid-column: 1 / -1; }
+  .info[hidden] { display: none; }
+  .info .p { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; cursor: pointer; color: var(--ink); }
+  .info .p.open { white-space: normal; max-height: 120px; overflow: auto; }
+  .info .m { font: 11.5px var(--mono); color: var(--mute); white-space: nowrap; }
+  .actions { display: flex; gap: 2px; flex: none; }
+
+  .strip { border-top: 1px solid var(--line); display: flex; flex-direction: column; min-width: 0; background: var(--panel); }
+  .strip .sec { margin: 9px 20px 2px; }
+  #history { display: flex; gap: 10px; overflow-x: auto; overflow-y: hidden; padding: 7px 22px 10px; scroll-snap-type: x proximity; scroll-padding: 0 22px; }
+  #history img { height: 72px; width: 72px; flex: none; object-fit: cover; border-radius: 5px; cursor: pointer;
+    opacity: .62; transition: opacity .15s, transform .15s; outline: 2px solid transparent; outline-offset: 2px; scroll-snap-align: start; }
+  #history img:hover { opacity: 1; transform: translateY(-2px); }
+  #history img.sel { opacity: 1; outline-color: var(--accent); }
+  #history .none { color: var(--faint); font-size: 12px; padding-top: 24px; }
+  ::-webkit-scrollbar { height: 8px; width: 8px; } ::-webkit-scrollbar-thumb { background: var(--line2); border-radius: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+
+  /* ---------- 模型抽屉 ---------- */
+  .scrim { position: fixed; inset: 0; background: rgba(0,0,0,.5); opacity: 0; pointer-events: none; transition: opacity .2s; z-index: 20; }
+  .drawer { position: fixed; top: 0; right: 0; bottom: 0; width: 460px; background: var(--panel); border-left: 1px solid var(--line2);
+    transform: translateX(100%); transition: transform .25s cubic-bezier(.2,.8,.2,1); z-index: 21; overflow: auto; padding: 20px; }
+  .drawer-open .scrim { opacity: 1; pointer-events: auto; }
+  .drawer-open .drawer { transform: none; }
+  .drawer h3 { font: 600 16px var(--serif); margin: 0 0 4px; display: flex; align-items: center; justify-content: space-between; }
+  .group { border: 1px solid var(--line); border-radius: 10px; padding: 14px; margin-top: 16px; background: var(--bg); }
+  .group h4 { margin: 0 0 8px; font: 600 13px var(--sans); display: flex; align-items: center; gap: 8px; }
+  .pill { font: 500 10.5px var(--mono); padding: 1px 7px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); }
+  .item { display: grid; grid-template-columns: 1fr auto; gap: 3px 8px; padding: 7px 0; border-top: 1px solid var(--line); font-size: 12.5px; }
+  .item:first-child { border-top: 0; }
+  .item .st { font: 11px var(--mono); color: var(--mute); text-align: right; }
+  .item .st.ok { color: var(--ok); }
+  .item .bar { grid-column: 1 / -1; margin-top: 2px; }
+  .row { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin-top: 12px; }
+  .btn { border: 1px solid var(--line2); background: var(--panel2); color: var(--ink); border-radius: 8px; padding: 8px 14px;
+         font: 500 12.5px var(--sans); cursor: pointer; }
+  .btn:hover:not(:disabled) { border-color: var(--accent); }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+  .hint { color: var(--faint); font-size: 11.5px; margin-top: 8px; }
+  .eta { color: var(--accent); font: 11.5px var(--mono); margin-top: 8px; }
+
+  .danger:hover { color: var(--bad) !important; }
+  .seg { display: grid; grid-template-columns: 1fr 1fr; background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+         padding: 2px; margin-bottom: 8px; }
+  .seg button { border: 0; background: none; color: var(--mute); padding: 6px; border-radius: 6px; cursor: pointer; font: 500 12px var(--sans); }
+  .seg button.on { background: var(--panel2); color: var(--ink); box-shadow: inset 0 0 0 1px var(--line2); }
+  .seg small { color: var(--accent); font-size: 10px; }
+  .msel[hidden] { display: none; }
+  .msel { display: grid; grid-template-columns: 64px minmax(0, 1fr); gap: 6px 8px; align-items: center; }
+  .msel label { font-size: 11.5px; color: var(--mute); }
+  .msel select { padding: 6px 26px 6px 9px; font-size: 12px; text-overflow: ellipsis; }
+  .mrow { display: grid; grid-template-columns: minmax(0, 1fr) auto auto auto; gap: 8px; align-items: center; padding: 7px 0;
+          border-top: 1px solid var(--line); font-size: 12px; }
+  .mrow:first-child { border-top: 0; }
+  .mrow .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mrow .n.cur::before { content: "● "; color: var(--accent); }
+  .mrow .s { font: 11px var(--mono); color: var(--mute); }
+  .mrow select { width: auto; padding: 3px 22px 3px 7px; font-size: 11.5px; background-position: right 7px center; }
+  .empty-note { color: var(--faint); font-size: 12px; padding: 4px 0; }
+  .add { display: grid; grid-template-columns: minmax(0, 1fr) 118px; gap: 8px; }
+  .add input, .add select { font-size: 12px; padding: 7px 9px; }
+  .add .wide { grid-column: 1 / -1; }
+  .presets { display: grid; gap: 6px; margin-top: 10px; }
+  .preset { text-align: left; border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 8px;
+            padding: 8px 10px; cursor: pointer; font: 12.5px var(--sans); }
+  .preset:hover { border-color: var(--accent); }
+  .preset small { display: block; color: var(--faint); font-size: 11px; margin-top: 1px; }
+  .task { padding: 8px 0; border-top: 1px solid var(--line); font-size: 12px; }
+  .task:first-child { border-top: 0; }
+  .task .top { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: center; }
+  .task .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .task .s { font: 11px var(--mono); color: var(--mute); margin-top: 3px; display: flex; justify-content: space-between; gap: 8px; }
+  .task .s.err { color: var(--bad); }
+  .task .ops { display: flex; gap: 0; }
+  .role-tag { font: 10.5px var(--mono); color: var(--mute); border: 1px solid var(--line2); border-radius: 4px; padding: 0 5px; margin-right: 6px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="brand">Qwen<em>·</em>Image <small>LOCAL</small></div>
+    <div class="meta">
+      <span id="mem">内存 –</span>
+      <span id="disk">磁盘 –</span>
+    </div>
+    <button class="chip" id="modelsBtn"><i></i><span id="modelChip">模型</span></button>
+    <button class="ghost" id="quit" title="关闭后台服务">退出</button>
+  </header>
+
+  <main>
+    <aside>
+      <div class="form">
+        <div class="sec"><span>提示词</span><span>⌘↩ 生成</span></div>
+        <textarea id="prompt" placeholder="描述你想要的画面，中英文都可以。&#10;例：一只橘猫坐在窗台上，傍晚的阳光，胶片质感"></textarea>
+        <input id="negative" placeholder="反向提示词（可选，CFG > 1 时生效）" style="margin-top:8px">
+
+        <div class="sec"><span>参考图</span><span>放了就是图生图</span></div>
+        <div class="drop" id="drop">点击或拖入一张图片<input type="file" id="file" accept="image/*" hidden></div>
+
+        <div class="sec"><span>模型</span><button class="ghost" id="manageBtn" style="padding:0;font:inherit;letter-spacing:0">管理 ›</button></div>
+        <div class="seg" id="engineSeg">
+          <button data-e="sd">sd.cpp</button><button data-e="mlx">MLX <small>实验</small></button>
+        </div>
+        <div class="msel" id="sdSel">
+          <label>生图模型</label><select id="sel_dit" data-role="dit"></select>
+          <label>文本编码</label><select id="sel_te" data-role="te"></select>
+          <label>VAE</label><select id="sel_vae" data-role="vae"></select>
+          <label>视觉组件</label><select id="sel_vision" data-role="vision"></select>
+        </div>
+        <div class="msel" id="mlxSel" hidden>
+          <label>模型包</label><select id="sel_mlx" data-role="mlx"></select>
+        </div>
+        <div class="hint" id="engineHint"></div>
+
+        <div class="sec"><span>参数</span></div>
+        <div class="grid2">
+          <div class="field"><label>尺寸</label>
+            <select id="size">
+              <option value="512x512">512 × 512 方</option>
+              <option value="512x768">512 × 768 竖</option>
+              <option value="768x512">768 × 512 横</option>
+              <option value="768x768">768 × 768 方</option>
+              <option value="768x1024">768 × 1024 竖（慢）</option>
+              <option value="1024x1024">1024 × 1024（很慢）</option>
+            </select></div>
+          <div class="field"><label>步数</label><input id="steps" type="number" min="1" max="80" value="12"></div>
+          <div class="field"><label>CFG</label>
+            <select id="cfg">
+              <option value="1">1 · 最快</option>
+              <option value="3">3 · 手部/文字更好</option>
+              <option value="6">6 · 官方示例</option>
+            </select></div>
+          <div class="field"><label>种子（-1 随机）</label><input id="seed" type="number" value="-1"></div>
+        </div>
+        <label class="toggle"><input type="checkbox" id="fast">
+          <span>加速 EasyCache<small>跳过变化小的步，更快但画面会变糊，步数多（30+）时才建议开</small></span></label>
+        <label class="toggle"><input type="checkbox" id="lowmem" checked>
+          <span>省内存模式<small>文本编码器从磁盘读，16 GB 机器建议开</small></span></label>
+      </div>
+
+      <div class="dock">
+        <button id="go">生成<span class="kbd">⌘↩</span></button>
+        <div class="status"><span id="stage">空闲</span><span id="eta"></span></div>
+        <div class="bar"><i id="prog"></i></div>
+        <div class="err" id="genErr"></div>
+        <details><summary>运行日志</summary><pre class="log" id="log"></pre></details>
+      </div>
+    </aside>
+
+    <section class="work">
+      <div class="stage" id="viewer"><div class="empty"><div class="big">暗房是空的</div>写好提示词，按 ⌘↩ 冲洗第一张</div></div>
+      <div class="info" id="info" hidden>
+        <span class="p" id="infoPrompt" title="点击展开 / 收起"></span>
+        <span class="m" id="infoMeta"></span>
+        <span class="actions">
+          <button class="ghost" id="reuse">复用参数</button>
+          <button class="ghost" id="asRef">当参考图</button>
+          <button class="ghost" id="reveal">在访达中显示</button>
+          <button class="ghost danger" id="delImg" title="移到废纸篓（Delete 键）">删除</button>
+        </span>
+      </div>
+      <div class="strip">
+        <div class="sec"><span>历史</span><span id="histCount"></span></div>
+        <div id="history"></div>
+      </div>
+    </section>
+  </main>
+</div>
+<div class="badge" id="badge"></div>
+
+<div class="scrim" id="scrim"></div>
+<div class="drawer" id="drawer">
+  <h3>模型管理 <button class="ghost" id="closeDrawer">关闭 ✕</button></h3>
+  <div class="hint" style="margin-top:0">模型放在 <code>models/</code> 文件夹，下载的文件会自动出现在这里。删除会移到废纸篓。</div>
+
+  <div class="group">
+    <h4>已有模型 <span class="pill" id="engineState">检查中</span></h4>
+    <div id="modelList"></div>
+  </div>
+
+  <div class="group">
+    <h4>添加下载</h4>
+    <div class="add">
+      <input id="dlUrl" class="wide" placeholder="粘贴下载链接：单个文件，或整个 Hugging Face 仓库">
+      <input id="dlName" placeholder="保存文件名（可选）">
+      <select id="dlRole"></select>
+      <select id="source" class="wide" title="下载源">
+        <option value="hf">Hugging Face 原站（走系统代理）</option>
+        <option value="mirror">国内镜像 hf-mirror（直连）</option>
+      </select>
+    </div>
+    <button class="btn" id="dlAdd" style="width:100%;margin-top:8px">加入下载队列</button>
+    <div class="err" id="dlErr"></div>
+    <div class="hint">推荐预设（点一下加入队列）：</div>
+    <div class="presets" id="presets"></div>
+  </div>
+
+  <div class="group">
+    <h4>下载队列 <button class="ghost" id="dlClear" style="margin-left:auto">清除已完成</button></h4>
+    <div id="taskList"></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const gb = b => b >= 1e9 ? (b / 1e9).toFixed(2) + ' GB' : (b / 1e6).toFixed(0) + ' MB';
+const fmt = s => s >= 3600 ? `${Math.floor(s / 3600)} 时 ${Math.floor(s % 3600 / 60)} 分` : s >= 60 ? `${Math.floor(s / 60)} 分 ${s % 60} 秒` : `${s} 秒`;
+const esc = t => String(t).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
+let refData = null, current = null, lastOutput, jobSeen = false, history = [], firstPoll = true, meta = {roles: {}, presets: []};
+const speeds = {};  // 每个下载任务最近 30 秒的字节采样
+
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} : {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+const drawer = open => document.body.classList.toggle('drawer-open', open);
+$('modelsBtn').onclick = $('manageBtn').onclick = () => drawer(true);
+$('closeDrawer').onclick = $('scrim').onclick = () => drawer(false);
+document.addEventListener('keydown', e => { if (e.key === 'Escape') drawer(false); });
+
+// ---------- 模型选择 / 管理 ----------
+let lastModelsKey = '';
+function renderModels(s) {
+  const key = JSON.stringify([s.models, s.sel, s.engine]);
+  if (key === lastModelsKey) return;
+  lastModelsKey = key;
+  for (const role of ['dit', 'te', 'vae', 'vision', 'mlx']) {
+    const el = $('sel_' + role), files = s.models.filter(m => m.role === role);
+    el.innerHTML = files.length
+      ? files.map(m => `<option value="${esc(m.file)}" ${m.file === s.sel[role] ? 'selected' : ''}>${esc(m.file)}</option>`).join('')
+      : '<option value="">（没有，去「管理」下载）</option>';
+    el.disabled = !files.length;
+  }
+  $('engineState').textContent = (s.engine ? 'sd.cpp ✓' : 'sd.cpp 未安装') + ' · ' + (s.mlx_engine ? 'MLX ✓' : 'MLX 未安装');
+  const mlx = s.sel.engine === 'mlx';
+  document.querySelectorAll('#engineSeg button').forEach(b => b.classList.toggle('on', b.dataset.e === s.sel.engine));
+  $('sdSel').hidden = mlx; $('mlxSel').hidden = !mlx;
+  $('engineHint').textContent = mlx
+    ? (s.mlx_engine ? 'MLX 引擎：苹果 MLX 框架，不支持参考图；省内存 / 加速开关对它无效。' : 'MLX-Serve 程序还没装，去「管理」下载「MLX 引擎套装」。')
+    : (s.engine ? '' : 'sd.cpp 程序还没装，去「管理」下载「基础套装」。');
+  const order = ['dit', 'te', 'vae', 'vision', 'mlx', 'other'];
+  const roleOpts = cur => order.map(r => `<option value="${r}" ${r === cur ? 'selected' : ''}>${esc(meta.roles[r] || r)}</option>`).join('');
+  const models = [...s.models].sort((a, b) => order.indexOf(a.role) - order.indexOf(b.role));
+  $('modelList').innerHTML = models.length ? models.map(m => `
+    <div class="mrow">
+      <span class="n ${s.sel[m.role] === m.file ? 'cur' : ''}" title="${esc(m.file)}">${esc(m.file)}</span>
+      <span class="s">${gb(m.size)}</span>
+      ${m.dir ? `<span class="s">${m.role === 'mlx' ? 'MLX 包' : '整个仓库'}</span>` : `<select data-file="${esc(m.file)}" class="roleSel" title="用途">${roleOpts(m.role)}</select>`}
+      <button class="ghost danger delModel" data-file="${esc(m.file)}">删除</button>
+    </div>`).join('') : '<div class="empty-note">还没有模型。用下面的预设或链接下载。</div>';
+  document.querySelectorAll('.roleSel').forEach(el => el.onchange = async () => {
+    await api('/api/model/role', {file: el.dataset.file, role: el.value}); lastModelsKey = ''; poll();
+  });
+  document.querySelectorAll('.delModel').forEach(el => el.onclick = async () => {
+    if (!confirm(`把「${el.dataset.file}」移到废纸篓？`)) return;
+    try { await api('/api/model/delete', {file: el.dataset.file}); } catch (e) { alert(e.message); }
+    lastModelsKey = ''; poll();
+  });
+}
+document.querySelectorAll('#engineSeg button').forEach(b => b.onclick = async () => {
+  await api('/api/select', {role: 'engine', file: b.dataset.e}); lastModelsKey = ''; poll();
+});
+['dit', 'te', 'vae', 'vision', 'mlx'].forEach(role => $('sel_' + role).onchange = async e => {
+  await api('/api/select', {role, file: e.target.value}); lastModelsKey = ''; poll();
+});
+
+// ---------- 下载队列 ----------
+function taskSpeed(t) {
+  const now = Date.now(), arr = speeds[t.id] = speeds[t.id] || [];
+  arr.push([now, t.have]);
+  while (arr.length > 2 && now - arr[0][0] > 30000) arr.shift();
+  const span = (now - arr[0][0]) / 1000;
+  return span >= 5 ? (t.have - arr[0][1]) / span : 0;
+}
+function renderTasks(s) {
+  const label = {queued: '排队中', downloading: '下载中', paused: '已暂停', done: '已完成', error: '出错'};
+  $('taskList').innerHTML = s.tasks.length ? s.tasks.map(t => {
+    const pct = t.size ? Math.min(100, t.have / t.size * 100) : 0;
+    let info = label[t.status] || t.status;
+    if (t.status === 'downloading') {
+      const sp = taskSpeed(t);
+      info = `${t.size ? pct.toFixed(1) + '% · ' : ''}${gb(t.have)}${t.size ? ' / ' + gb(t.size) : ''}`
+        + (sp > 0 ? ` · ${(sp / 1e6).toFixed(1)} MB/s` + (t.size ? ` · 剩 ${fmt(Math.round((t.size - t.have) / sp))}` : '') : ' · 测速中');
+    } else { delete speeds[t.id]; if (t.status !== 'done' && t.size) info += ` · ${pct.toFixed(0)}%`; }
+    const ops = t.status === 'downloading' || t.status === 'queued' ? `<button class="ghost" data-a="pause" data-id="${t.id}">暂停</button>`
+      : t.status === 'paused' || t.status === 'error' ? `<button class="ghost" data-a="resume" data-id="${t.id}">继续</button>` : '';
+    return `<div class="task">
+      <div class="top"><span class="n" title="${esc(t.url)}"><span class="role-tag">${esc(meta.roles[t.role] || t.role)}</span>${esc(t.name)}</span>
+        <span class="ops">${ops}<button class="ghost danger" data-a="remove" data-id="${t.id}">${t.status === 'done' ? '移出' : '移除'}</button></span></div>
+      ${t.status !== 'done' && (t.have || t.status === 'downloading') ? `<div class="bar"><i style="width:${pct}%"></i></div>` : ''}
+      <div class="s ${t.status === 'error' ? 'err' : ''}"><span>${esc(info)}</span><span>${t.error && t.status !== 'done' ? esc(t.error) : ''}</span></div>
+    </div>`;
+  }).join('') : '<div class="empty-note">队列是空的</div>';
+  document.querySelectorAll('#taskList [data-a]').forEach(b => b.onclick = async () => {
+    if (b.dataset.a === 'remove' && !b.textContent.includes('移出') && !confirm('移除这个下载？已下载的部分会移到废纸篓。')) return;
+    await api('/api/dl/action', {id: b.dataset.id, action: b.dataset.a}); poll();
+  });
+}
+async function addItems(items) {
+  $('dlErr').textContent = '';
+  try {
+    const r = await api('/api/dl/add', {items, source: $('source').value});
+    if (!r.added) $('dlErr').textContent = '这些文件已经在队列里了';
+  } catch (e) { $('dlErr').textContent = e.message; }
+  poll();
+}
+$('dlAdd').onclick = async () => {
+  if (!$('dlUrl').value.trim()) return;
+  await addItems([{url: $('dlUrl').value, role: $('dlRole').value, name: $('dlName').value}]);
+  if (!$('dlErr').textContent) $('dlUrl').value = $('dlName').value = '';
+};
+$('dlClear').onclick = async () => { await api('/api/dl/action', {action: 'clear'}); poll(); };
+
+async function loadMeta() {
+  meta = await api('/api/meta');
+  $('dlRole').innerHTML = Object.entries(meta.roles).map(([k, v]) => `<option value="${k}">${esc(v)}</option>`).join('');
+  $('presets').innerHTML = meta.presets.map((p, i) => `<button class="preset" data-i="${i}">${esc(p.name)}<small>${esc(p.desc)}</small></button>`).join('');
+  document.querySelectorAll('.preset').forEach(b => b.onclick = () => addItems(meta.presets[b.dataset.i].items));
+}
+
+function renderChip(s) {
+  const ready = s.sel.engine === 'mlx' ? (s.mlx_engine && s.sel.mlx) : (s.engine && s.sel.dit && s.sel.te && s.sel.vae);
+  const active = s.tasks.filter(t => t.status === 'downloading' || t.status === 'queued');
+  let chip = ready ? '模型就绪' : '需要下载模型', cls = ready ? 'ok' : 'need';
+  if (active.length) {
+    const tot = active.reduce((a, t) => a + (t.size || 0), 0), got = active.reduce((a, t) => a + t.have, 0);
+    chip = `下载中 ${tot ? Math.floor(got / tot * 100) + '%' : ''} · ${active.length} 个`; cls = 'busy';
+  }
+  $('modelChip').textContent = chip;
+  $('modelsBtn').className = 'chip ' + cls;
+  if (firstPoll && !ready && !s.engine && !s.mlx_engine) drawer(true);
+  firstPoll = false;
+  return ready;
+}
+
+// ---------- 生成 ----------
+function renderJob(s, ready) {
+  const j = s.job;
+  $('go').disabled = !j.running && !ready;
+  $('go').innerHTML = j.running ? '取消' : (ready ? '生成<span class="kbd">⌘↩</span>' : '先下载模型');
+  $('go').classList.toggle('cancel', j.running);
+  let stage = j.stage;
+  if (j.total) stage += ` · ${j.step}/${j.total}`;
+  if (j.spi) stage += ` · ${j.spi.toFixed(1)}s/步`;
+  $('stage').textContent = stage;
+  $('eta').textContent = j.running ? `${fmt(j.elapsed)}` + (j.eta != null ? ` · 剩 ${fmt(j.eta)}` : '') : '';
+  $('prog').style.width = j.total ? (j.step / j.total * 100) + '%' : (j.running ? '3%' : '0');
+  $('genErr').textContent = j.error || '';
+  $('badge').textContent = j.running ? `冲洗中 · ${stage}` : '';
+  $('badge').classList.toggle('on', j.running);
+  const log = $('log'), atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 5;
+  log.textContent = j.log.join('\n');
+  if (atBottom) log.scrollTop = log.scrollHeight;
+  // 第一次轮询只记下后台已有的结果；之后出现新结果就刷新历史并展示
+  if (!jobSeen) { jobSeen = true; lastOutput = j.output; }
+  else if (j.output && j.output !== lastOutput) {
+    lastOutput = j.output;
+    loadHistory().then(() => show(history.find(h => h.name === j.output)));
+  }
+}
+
+async function poll() {
+  try {
+    const s = await api('/api/status');
+    $('mem').innerHTML = s.mem == null ? '' : `内存 <b class="${s.mem < 6 ? 'warn' : ''}">${s.mem} GB</b>`;
+    $('mem').title = s.mem < 6 ? '可用内存偏少，建议关掉些软件' : '当前可用内存';
+    $('disk').innerHTML = `磁盘 <b>${s.disk} GB</b>`;
+    renderModels(s);
+    renderTasks(s);
+    renderJob(s, renderChip(s));
+  } catch (e) {
+    $('stage').textContent = '后台服务已停止，重新打开「Qwen 生图」即可';
+  }
+}
+
+// ---------- 历史 ----------
+async function loadHistory() {
+  history = await api('/api/history');
+  $('histCount').textContent = history.length ? `${history.length} 张` : '';
+  $('history').innerHTML = history.map((h, i) =>
+    `<img loading="lazy" src="/outputs/${h.name}" data-i="${i}" title="${esc(h.prompt.slice(0, 200))}">`).join('')
+    || '<div class="none">还没有作品，生成的图会按时间排在这里</div>';
+  $('history').querySelectorAll('img').forEach(img => img.onclick = () => show(history[img.dataset.i]));
+  if (!history.includes(current)) current = null;
+  if (!current && history.length) show(history[0]);
+  if (!history.length) {
+    $('viewer').innerHTML = '<div class="empty"><div class="big">暗房是空的</div>写好提示词，按 ⌘↩ 冲洗第一张</div>';
+    $('info').hidden = true;
+  }
+}
+
+function show(h) {
+  if (!h) return;
+  current = h;
+  $('viewer').innerHTML = `<img src="/outputs/${h.name}">`;
+  $('info').hidden = false;
+  $('infoPrompt').textContent = h.prompt;
+  $('infoPrompt').classList.remove('open');
+  $('infoMeta').textContent = `${h.size.replace('x', '×')} · ${h.steps}步 · CFG ${h.cfg}` + (h.seconds ? ` · ${fmt(h.seconds)}` : '')
+    + (h.fast ? ' · 加速' : '') + (h.ref ? ' · 图生图' : '') + (h.engine === 'mlx' ? ' · MLX' : '') + (h.dit ? ` · ${h.dit.replace(/\.(gguf|safetensors)$/, '')}` : '');
+  $('infoMeta').title = `种子 ${h.seed}` + (h.te ? `\n文本编码器 ${h.te}` : '');
+  $('history').querySelectorAll('img').forEach(img => {
+    const on = history[img.dataset.i] === h;
+    img.classList.toggle('sel', on);
+    if (on) img.scrollIntoView({block: 'nearest', inline: 'nearest'});
+  });
+}
+$('infoPrompt').onclick = () => $('infoPrompt').classList.toggle('open');
+
+async function deleteCurrent() {
+  if (!current || !confirm('把这张图移到废纸篓？')) return;
+  const i = history.indexOf(current);
+  await api('/api/history/delete', {name: current.name});
+  current = null;
+  await loadHistory();
+  if (history.length) show(history[Math.min(i, history.length - 1)]);
+}
+$('delImg').onclick = deleteCurrent;
+
+// ---------- 参考图 ----------
+function setRef(dataUrl) {
+  refData = dataUrl;
+  $('drop').innerHTML = dataUrl
+    ? `<img src="${dataUrl}"><button class="ghost x" id="rmRef">移除</button>`
+    : '点击或拖入一张图片<input type="file" id="file" accept="image/*" hidden>';
+  if (dataUrl) $('rmRef').onclick = e => { e.stopPropagation(); setRef(null); };
+  else $('file').onchange = e => readFile(e.target.files[0]);
+}
+function readFile(f) {
+  if (!f) return;
+  const r = new FileReader();
+  r.onload = () => setRef(r.result);
+  r.readAsDataURL(f);
+}
+$('drop').onclick = () => { if (!refData) $('file').click(); };
+$('file').onchange = e => readFile(e.target.files[0]);
+$('drop').ondragover = e => { e.preventDefault(); $('drop').classList.add('over'); };
+$('drop').ondragleave = () => $('drop').classList.remove('over');
+$('drop').ondrop = e => { e.preventDefault(); $('drop').classList.remove('over'); readFile(e.dataTransfer.files[0]); };
+
+$('go').onclick = async () => {
+  if ($('go').classList.contains('cancel')) { await api('/api/cancel', {}); return poll(); }
+  try {
+    await api('/api/generate', {
+      prompt: $('prompt').value, negative: $('negative').value, ref: refData,
+      size: $('size').value, steps: +$('steps').value, cfg: +$('cfg').value,
+      seed: +$('seed').value, lowmem: $('lowmem').checked, fast: $('fast').checked,
+    });
+  } catch (e) { $('genErr').textContent = e.message; }
+  poll();
+};
+
+$('reuse').onclick = () => {
+  if (!current) return;
+  $('prompt').value = current.prompt; $('negative').value = current.negative || '';
+  $('size').value = current.size; $('steps').value = current.steps;
+  $('cfg').value = String(current.cfg); $('seed').value = current.seed; $('fast').checked = !!current.fast;
+};
+$('asRef').onclick = async () => {
+  if (!current) return;
+  const b = await (await fetch('/outputs/' + current.name)).blob();
+  readFile(new File([b], current.name, {type: b.type}));
+};
+$('reveal').onclick = () => current && api('/api/reveal', {name: current.name});
+$('quit').onclick = async () => {
+  if (!confirm('退出后台服务？正在进行的生成会停止，下载会在下次打开时自动继续。')) return;
+  if (window.webkit?.messageHandlers?.native) return window.webkit.messageHandlers.native.postMessage('quit');
+  await api('/api/quit', {}).catch(() => {});
+  document.body.innerHTML = '<p style="padding:40px;text-align:center">已退出，可以关掉这个页面了。</p>';
+};
+document.addEventListener('keydown', e => {
+  const typing = /INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName);
+  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !$('go').disabled && !$('go').classList.contains('cancel')) $('go').click();
+  else if ((e.key === 'Delete' || e.key === 'Backspace') && !typing && !document.body.classList.contains('drawer-open')) deleteCurrent();
+  else if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && !typing && current) {
+    const i = history.indexOf(current) + (e.key === 'ArrowRight' ? 1 : -1);
+    if (history[i]) show(history[i]);
+  }
+});
+
+loadMeta().then(poll);
+loadHistory();
+setInterval(poll, 1500);
+</script>
+</body>
+</html>

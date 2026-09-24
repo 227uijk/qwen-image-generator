@@ -1,0 +1,24 @@
+# 下载的模型和引擎程序（体积大，用户自己在工具里下载）
+models/
+bin/
+
+# 生成结果与运行时状态
+outputs/
+tmp/
+history.json
+settings.json
+downloads.json
+*.json.tmp
+app.log
+
+# 构建产物（用 ./build.sh 生成）
+*.app/
+launcher/AppIcon.iconset/
+launcher/AppIcon.icns
+
+# 系统与编辑器
+.DS_Store
+__pycache__/
+*.pyc
+.claude/
+launcher/.build/
