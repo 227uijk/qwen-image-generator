@@ -456,7 +456,7 @@ function renderJob(s, ready) {
   if (j.total) stage += ` · ${j.step}/${j.total}`;
   if (j.spi) stage += ` · ${j.spi.toFixed(1)}s/步`;
   $('stage').textContent = stage;
-  $('eta').textContent = j.running ? `${fmt(j.elapsed)}` + (j.eta != null ? ` · 剩 ${fmt(j.eta)}` : '') : '';
+  $('eta').textContent = j.running ? `${fmt(j.elapsed)}` + (j.eta != null ? ` · 剩 ${fmt(j.eta)}` : '') : s.warm;
   $('prog').style.width = j.total ? (j.step / j.total * 100) + '%' : (j.running ? '3%' : '0');
   $('genErr').textContent = reqErr || j.error || '';
   $('badge').textContent = j.running ? `冲洗中 · ${stage}` : '';

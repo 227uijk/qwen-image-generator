@@ -7,9 +7,11 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import threading
 import time
+import urllib.request
 import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -31,7 +33,6 @@ for d in (BIN, MODELS, OUT, TMP):
 ROLES = {"dit": "生图模型", "te": "文本编码器", "vae": "VAE", "vision": "视觉组件",
          "engine": "sd.cpp 程序", "mlx": "MLX 模型包（整个仓库）", "mlx_engine": "MLX-Serve 程序",
          "other": "其他（仅下载）"}
-MLX_PORT = PORT + 1
 MODEL_EXT = (".gguf", ".safetensors")
 
 # 推荐预设：只是帮忙填好链接，用户也可以自己贴任意链接
@@ -122,8 +123,8 @@ def avail_mem_gb():
     return round(pages * page / 2**30, 1)
 
 
-def sd_cli():
-    for p in BIN.rglob("sd-cli"):
+def sd_server():
+    for p in BIN.rglob("sd-server"):
         if p.is_file() and os.access(p, os.X_OK):
             return p
     return None
@@ -468,184 +469,365 @@ def task_view():
     return out
 
 
-# ---------- 生成 ----------
+# ---------- 常驻引擎 ----------
+# 引擎以服务方式常驻，模型加载一次后留在内存里，之后每张图都省掉加载时间。
+# 同一时间只留一个引擎（sd-server 或 mlx-serve）；换模型、换引擎、切省内存模式时重启。
 
 PROG = re.compile(r"\|\s*(\d+)/(\d+)\s*-\s*([\d.]+)(s/it|it/s)")
+ENGINE_PID = TMP / "engine.pid"
+eng_lock = threading.Lock()  # 同一时间只有一个线程在启动 / 使用引擎
+eng = {"proc": None, "key": None, "port": None, "warming": False, "timer": None}
+# 走本机回环，不能被系统代理截走
+local = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def gen_worker(cmd, record):
-    try:
-        p = subprocess.Popen(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             start_new_session=True)
-        job["proc"] = p
-        if job["cancelled"]:
-            os.killpg(p.pid, signal.SIGTERM)
-        buf = b""
-        while True:
-            chunk = p.stdout.read1(4096)
-            if not chunk:
-                break
-            buf += chunk
-            parts = re.split(rb"[\r\n]", buf)
-            buf = parts.pop()
-            # 进度行以 \r 结尾前就可能停住，尾巴里若已是完整进度也一并处理，避免显示慢一步
-            tail = buf.decode("utf-8", "replace")
-            if PROG.search(tail) and ("s/it" in tail or "it/s" in tail):
-                parts.append(buf)
-                buf = b""
-            for raw in parts:
-                line = raw.decode("utf-8", "replace").strip()
-                if not line:
-                    continue
-                m = PROG.search(line)
-                if m:
-                    n, t, v, unit = int(m[1]), int(m[2]), float(m[3]), m[4]
-                    # EasyCache 跳过的步报告的耗时接近 0，用实际经过时间求平均更准
-                    now = time.time()
-                    if n <= 1 or "t_first" not in job or n < job.get("step", 0):
-                        job["t_first"], job["n_first"] = now, n
-                        spi = v if unit == "s/it" else (1 / v if v else None)
-                    else:
-                        spi = (now - job["t_first"]) / max(1, n - job["n_first"]) if n > job["n_first"] else job["spi"]
-                    job.update(step=n, total=t, spi=spi)
-                    job["stage"] = "采样中" if n < t else "解码中（VAE）"
-                    continue
-                low = line.lower()
-                if job["step"] == 0:
-                    if "load" in low:
-                        job["stage"] = "加载模型"
-                    elif "condition" in low or "encod" in low:
-                        job["stage"] = "编码提示词"
-                job["log"].append(line[:400])
-                del job["log"][:-300]
-        rc = p.wait()
-        out = Path(record["file"])
-        if job["cancelled"]:
-            job["stage"] = "已取消"
-        elif rc == 0 and out.exists():
-            job["stage"] = "完成"
-            job["output"] = out.name
-            record["seconds"] = round(time.time() - job["started"])
-            with lock:
-                h = load_history()
-                h.append(record)
-                save_history(h)
+def free_port():
+    # 随机端口：sd-server 对任何网页都放开了跨域，不用固定端口让别的网站难以撞上
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def eng_alive():
+    return eng["proc"] is not None and eng["proc"].poll() is None
+
+
+def eng_call(path, body=None, timeout=10):
+    data = None if body is None else json.dumps(body).encode()
+    r = urllib.request.Request(f"http://127.0.0.1:{eng['port']}{path}", data=data,
+                               headers={"Content-Type": "application/json"})
+    return local.open(r, timeout=timeout)
+
+
+def http_detail(e):
+    detail = e.read().decode("utf-8", "replace")[:500] if hasattr(e, "read") else ""
+    return (str(e) + ("\n" + detail if detail else "")).strip()
+
+
+def log_line(line):
+    job["log"].append(line[:400])
+    del job["log"][:-300]
+
+
+def sd_line(line):
+    live = job["running"] and not eng["warming"]  # 预热那张图的进度不算进任务
+    m = PROG.search(line)
+    if m:
+        if not live:
+            return
+        n, t, v, unit = int(m[1]), int(m[2]), float(m[3]), m[4]
+        # EasyCache 跳过的步报告的耗时接近 0，用实际经过时间求平均更准
+        now = time.time()
+        if n <= 1 or "t_first" not in job or n < job.get("step", 0):
+            job["t_first"], job["n_first"] = now, n
+            spi = v if unit == "s/it" else (1 / v if v else None)
         else:
-            job["stage"] = "失败"
-            job["error"] = "\n".join(job["log"][-12:]) or f"sd-cli 退出码 {rc}"
-    except Exception as e:
-        job["stage"] = "失败"
-        job["error"] = str(e)
-    finally:
-        if record["ref"]:  # 参考图只是临时文件，用完就删
-            (TMP / record["ref"]).unlink(missing_ok=True)
-        job["running"] = False
-        job["proc"] = None
+            spi = (now - job["t_first"]) / max(1, n - job["n_first"]) if n > job["n_first"] else job["spi"]
+        job.update(step=n, total=t, spi=spi)
+        job["stage"] = "采样中" if n < t else "解码中（VAE）"
+        return
+    low = line.lower()
+    if live and job["step"] == 0:
+        if "load" in low:
+            job["stage"] = "加载模型"
+        elif "condition" in low or "encod" in low:
+            job["stage"] = "编码提示词"
+    log_line(line)
 
 
-def mlx_worker(req, record, pack):
-    """用 MLX-Serve 生成一张图：临时起服务 → 加载模型包 → 流式生成 → 关服务释放内存。"""
-    import urllib.request
-    base = f"http://127.0.0.1:{MLX_PORT}"
-    empty = TMP / "mlx-empty"
-    empty.mkdir(exist_ok=True)
-    srv = None
-
-    def post(path, body, timeout=600):
-        r = urllib.request.Request(base + path, data=json.dumps(body).encode(),
-                                   headers={"Content-Type": "application/json"})
-        return urllib.request.urlopen(r, timeout=timeout)
-
-    def pump(stream):  # 服务日志进运行日志
-        for raw in iter(stream.readline, b""):
+def pump_sd(stream):
+    buf = b""
+    while True:
+        chunk = stream.read1(4096)
+        if not chunk:
+            break
+        buf += chunk
+        parts = re.split(rb"[\r\n]", buf)
+        buf = parts.pop()
+        # 进度行以 \r 结尾前就可能停住，尾巴里若已是完整进度也一并处理，避免显示慢一步
+        tail = buf.decode("utf-8", "replace")
+        if PROG.search(tail) and ("s/it" in tail or "it/s" in tail):
+            parts.append(buf)
+            buf = b""
+        for raw in parts:
             line = raw.decode("utf-8", "replace").strip()
             if line:
-                job["log"].append("[mlx] " + line[:400])
-                del job["log"][:-300]
+                sd_line(line)
 
-    try:
-        # 关掉 16 GB 机器上拦加载的两道检查：常驻内存上限、加载前空闲内存预检
-        srv = subprocess.Popen([str(mlx_serve()), "--serve", "--host", "127.0.0.1", "--port", str(MLX_PORT),
-                                "--model-dir", str(empty), "--max-resident-mem", "0", "--skip-mem-preflight"],
-                               cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
-        job["proc"] = srv
-        threading.Thread(target=pump, args=(srv.stdout,), daemon=True).start()
-        job["stage"] = "启动 MLX 引擎"
-        for _ in range(120):
-            if job["cancelled"] or srv.poll() is not None:
-                break
+
+def pump_mlx(stream):
+    for raw in iter(stream.readline, b""):
+        line = raw.decode("utf-8", "replace").strip()
+        if line:
+            log_line("[mlx] " + line)
+
+
+def stop_engine():
+    p = eng["proc"]
+    if p and p.poll() is None:
+        try:
+            os.killpg(p.pid, signal.SIGTERM)
+            p.wait(timeout=10)
+        except Exception:
             try:
-                urllib.request.urlopen(base + "/health", timeout=1)
-                break
+                os.killpg(p.pid, signal.SIGKILL)
             except Exception:
-                time.sleep(0.5)
-        if srv.poll() is not None:
-            raise RuntimeError("MLX-Serve 没能启动，看运行日志")
+                pass
+    eng.update(proc=None, key=None, port=None)
+    ENGINE_PID.unlink(missing_ok=True)
+
+
+def kill_stale_engine():
+    """上次异常退出留下的引擎还占着内存，启动时清掉。"""
+    try:
+        pid = int(ENGINE_PID.read_text())
+        cmd = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True).stdout
+        if "sd-server" in cmd or "mlx-serve" in cmd:
+            os.killpg(pid, signal.SIGTERM)
+    except Exception:
+        pass
+    ENGINE_PID.unlink(missing_ok=True)
+
+
+def start_engine(key, argv, health, pump):
+    stop_engine()
+    port = free_port()
+    p = subprocess.Popen(argv(port), cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         start_new_session=True)
+    ENGINE_PID.write_text(str(p.pid))
+    eng.update(proc=p, key=key, port=port)
+    threading.Thread(target=pump, args=(p.stdout,), daemon=True).start()
+    for _ in range(240):
+        if p.poll() is not None:
+            break
+        try:
+            eng_call(health, timeout=1).read()
+            return
+        except Exception:
+            time.sleep(0.5)
+    stop_engine()
+    raise RuntimeError("引擎没能启动，看运行日志")
+
+
+def sd_key(sel, lowmem):
+    return ("sd", sel["dit"], sel["te"], sel["vae"], sel["vision"], bool(lowmem))
+
+
+def ensure_sd(sel, lowmem, warm=False):
+    key = sd_key(sel, lowmem)
+    if eng_alive() and eng["key"] == key:
+        return
+
+    def argv(port):
+        a = [str(sd_server()), "--listen-ip", "127.0.0.1", "--listen-port", str(port),
+             "--diffusion-model", str(MODELS / sel["dit"]),
+             "--vae", str(MODELS / sel["vae"]),
+             "--llm", str(MODELS / sel["te"]),
+             "--sampling-method", "euler", "--diffusion-fa", "-v",
+             # Qwen 2.1 的 VAE 是 3D 卷积，M2 上 Metal 实现很慢，放 CPU 快 3 倍且结果一致
+             "--backend", "vae=cpu"]
+        if sel["vision"]:  # 权重按需加载，不放参考图时不占内存
+            a += ["--llm_vision", str(MODELS / sel["vision"])]
+        if lowmem:
+            a += ["--params-backend", "te=disk"]
+        return a
+    start_engine(key, argv, "/sdcpp/v1/capabilities", pump_sd)
+    if warm:  # 权重是第一次用到时才加载的，出一张极小的图把它们提前拉进内存
+        eng["warming"] = True
+        try:
+            run_sd_job({"prompt": "warm up", "width": 256, "height": 256, "seed": 1,
+                        "sample_params": {"sample_steps": 1}})
+        finally:
+            eng["warming"] = False
+
+
+def run_sd_job(body):
+    """向 sd-server 提交一张图并等它出完，返回 PNG 的 base64。"""
+    p = eng["proc"]
+    try:
+        jid = json.loads(eng_call("/sdcpp/v1/img_gen", body, timeout=60).read())["id"]
+    except Exception as e:
+        if p.poll() is not None:
+            raise RuntimeError("引擎意外退出，看运行日志")
+        raise RuntimeError(http_detail(e))
+    while True:
+        time.sleep(0.5)
+        if p.poll() is not None:
+            raise RuntimeError("引擎意外退出，看运行日志")
+        try:
+            s = json.loads(eng_call(f"/sdcpp/v1/jobs/{jid}").read())
+        except Exception:
+            continue  # 偶尔超时不要紧，进程还活着就接着等
+        if s["status"] == "completed":
+            return s["result"]["images"][0]["b64_json"]
+        if s["status"] in ("failed", "cancelled"):
+            raise RuntimeError((s.get("error") or {}).get("message") or "生成失败")
+
+
+def ensure_mlx(pack):
+    key = ("mlx", pack)
+    if eng_alive() and eng["key"] == key:
+        return
+    empty = TMP / "mlx-empty"
+    empty.mkdir(exist_ok=True)
+    # 关掉 16 GB 机器上拦加载的两道检查：常驻内存上限、加载前空闲内存预检
+    start_engine(key, lambda port: [str(mlx_serve()), "--serve", "--host", "127.0.0.1", "--port", str(port),
+                                    "--model-dir", str(empty), "--max-resident-mem", "0", "--skip-mem-preflight"],
+                 "/health", pump_mlx)
+    try:
+        eng_call("/v1/load-model", {"model": str(MODELS / pack)}, timeout=900).read()
+    except Exception as e:
+        stop_engine()
+        raise RuntimeError(http_detail(e))
+
+
+def lock_engine():
+    """等引擎空出来（可能正在预热），等的时候也能取消。"""
+    while not eng_lock.acquire(timeout=0.5):
         if job["cancelled"]:
             raise RuntimeError("cancelled")
-        job["stage"] = "加载模型"
-        post("/v1/load-model", {"model": str(MODELS / pack)}, timeout=900).read()
-        body = {"model": Path(pack).name, "prompt": record["prompt"], "size": record["size"],
-                "steps": record["steps"], "seed": record["seed"], "guidance_scale": record["cfg"], "stream": True}
-        if record["negative"]:
-            body["negative_prompt"] = record["negative"]
-        job["stage"] = "编码提示词"
-        resp = post("/v1/images/generations", body, timeout=7200)
-        b64 = None
-        for raw in resp:
-            line = raw.decode("utf-8", "replace").strip()
-            if not line.startswith("data:"):
-                continue
-            data = line[5:].strip()
-            if data == "[DONE]":
-                break
-            try:
-                ev = json.loads(data)
-            except Exception:
-                continue
-            if isinstance(ev.get("data"), list) and ev["data"] and ev["data"][0].get("b64_json"):
-                b64 = ev["data"][0]["b64_json"]
-            elif ev.get("b64_json") or ev.get("image"):
-                b64 = ev.get("b64_json") or ev.get("image")
-            step = ev.get("step") if ev.get("step") is not None else ev.get("current")
-            total = ev.get("total") or ev.get("total_steps") or ev.get("steps")
-            if step is not None and total:
-                now = time.time()
-                if "t_first" not in job:
-                    job["t_first"], job["n_first"] = now, int(step)
-                n = int(step)
-                spi = (now - job["t_first"]) / (n - job["n_first"]) if n > job["n_first"] else job["spi"]
-                job.update(step=n, total=int(total), spi=spi,
-                           stage="采样中" if n < int(total) else "解码中（VAE）")
-            if ev.get("error"):
-                raise RuntimeError(str(ev["error"]))
-        if not b64:
-            raise RuntimeError("MLX-Serve 没有返回图片，看运行日志")
+
+
+def preload():
+    """把当前选中的模型提前加载进引擎；条件不满足时关掉引擎释放内存。"""
+    if dl_state.get("quitting"):
+        return
+    with eng_lock:
+        try:
+            sel = selection()
+            if sel["engine"] == "mlx":
+                if mlx_serve() and sel["mlx"]:
+                    ensure_mlx(sel["mlx"])
+                else:
+                    stop_engine()
+            elif sd_server() and sel["dit"] and sel["te"] and sel["vae"]:
+                ensure_sd(sel, load_json(SETTINGS, {}).get("lowmem", True), warm=True)
+            else:
+                stop_engine()
+        except Exception as e:
+            if not job["running"]:
+                log_line(f"预载模型失败：{e}")
+
+
+def schedule_preload(delay=1.5):
+    """连着切几次模型时只在最后一次之后预载。"""
+    t = eng.get("timer")
+    if t:
+        t.cancel()
+    eng["timer"] = threading.Timer(delay, preload)
+    eng["timer"].daemon = True
+    eng["timer"].start()
+
+
+def warm_state():
+    if eng["warming"] or (eng_lock.locked() and not job["running"]):
+        return "模型预载中…"
+    return "模型已就绪" if eng_alive() else ""
+
+
+def finish(record, b64=None):
+    if b64:
         Path(record["file"]).write_bytes(base64.b64decode(b64))
-        job["stage"] = "完成"
-        job["output"] = record["name"]
-        record["seconds"] = round(time.time() - job["started"])
-        with lock:
-            h = load_history()
-            h.append(record)
-            save_history(h)
+    job["stage"] = "完成"
+    job["output"] = record["name"]
+    record["seconds"] = round(time.time() - job["started"])
+    with lock:
+        h = load_history()
+        h.append(record)
+        save_history(h)
+
+
+def fail(e):
+    if job["cancelled"]:
+        job["stage"] = "已取消"
+        schedule_preload()
+    else:
+        job["stage"] = "失败"
+        job["error"] = str(e)
+
+
+def sd_worker(sel, lowmem, body, record):
+    try:
+        lock_engine()
+        try:
+            if not (eng_alive() and eng["key"] == sd_key(sel, lowmem)):
+                job["stage"] = "启动引擎"
+            ensure_sd(sel, lowmem)
+            job["proc"] = eng["proc"]
+            if job["cancelled"]:
+                raise RuntimeError("cancelled")
+            job["stage"] = "编码提示词"
+            b64 = run_sd_job(body)
+        finally:
+            eng_lock.release()
+        finish(record, b64)
     except Exception as e:
-        if job["cancelled"]:
-            job["stage"] = "已取消"
-        else:
-            job["stage"] = "失败"
-            detail = e.read().decode("utf-8", "replace")[:500] if hasattr(e, "read") else ""
-            job["error"] = (str(e) + ("\n" + detail if detail else "")).strip()
+        fail(e)
+        if job["error"]:
+            job["error"] += "\n" + "\n".join(job["log"][-12:])
     finally:
-        if srv and srv.poll() is None:
-            try:
-                os.killpg(srv.pid, signal.SIGTERM)
-                srv.wait(timeout=10)
-            except Exception:
-                os.killpg(srv.pid, signal.SIGKILL)
         job["running"] = False
         job["proc"] = None
 
+
+def mlx_worker(record, pack):
+    """用常驻的 MLX-Serve 流式生成一张图。"""
+    try:
+        lock_engine()
+        try:
+            if not (eng_alive() and eng["key"] == ("mlx", pack)):
+                job["stage"] = "加载模型"
+            ensure_mlx(pack)
+            job["proc"] = eng["proc"]
+            if job["cancelled"]:
+                raise RuntimeError("cancelled")
+            body = {"model": Path(pack).name, "prompt": record["prompt"], "size": record["size"],
+                    "steps": record["steps"], "seed": record["seed"], "guidance_scale": record["cfg"], "stream": True}
+            if record["negative"]:
+                body["negative_prompt"] = record["negative"]
+            job["stage"] = "编码提示词"
+            resp = eng_call("/v1/images/generations", body, timeout=7200)
+            b64 = None
+            for raw in resp:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    ev = json.loads(data)
+                except Exception:
+                    continue
+                if isinstance(ev.get("data"), list) and ev["data"] and ev["data"][0].get("b64_json"):
+                    b64 = ev["data"][0]["b64_json"]
+                elif ev.get("b64_json") or ev.get("image"):
+                    b64 = ev.get("b64_json") or ev.get("image")
+                step = ev.get("step") if ev.get("step") is not None else ev.get("current")
+                total = ev.get("total") or ev.get("total_steps") or ev.get("steps")
+                if step is not None and total:
+                    now = time.time()
+                    if "t_first" not in job:
+                        job["t_first"], job["n_first"] = now, int(step)
+                    n = int(step)
+                    spi = (now - job["t_first"]) / (n - job["n_first"]) if n > job["n_first"] else job["spi"]
+                    job.update(step=n, total=int(total), spi=spi,
+                               stage="采样中" if n < int(total) else "解码中（VAE）")
+                if ev.get("error"):
+                    raise RuntimeError(str(ev["error"]))
+        finally:
+            eng_lock.release()
+        if not b64:
+            raise RuntimeError("MLX-Serve 没有返回图片，看运行日志")
+        finish(record, b64)
+    except Exception as e:
+        fail(http_detail(e))
+    finally:
+        job["running"] = False
+        job["proc"] = None
+
+
+# ---------- 生成 ----------
 
 def parse_params(req):
     """校验并解析生成参数；出错抛 ValueError，此时任务还没占用。"""
@@ -688,7 +870,7 @@ def claim_job():
 
 
 def start_generate(req):
-    exe = sd_cli()
+    exe = sd_server()
     sel = selection()
     ref = req.get("ref")
     if sel["engine"] == "mlx":
@@ -706,33 +888,22 @@ def start_generate(req):
         return "已有任务在跑"
     stamp = time.strftime("%Y%m%d_%H%M%S")
     out = OUT / f"qwen_{stamp}.png"
-    cmd = [str(exe),
-           "--diffusion-model", str(MODELS / sel["dit"]),
-           "--vae", str(MODELS / sel["vae"]),
-           "--llm", str(MODELS / sel["te"]),
-           "-p", prm["prompt"],
-           "--cfg-scale", str(prm["cfg"]), "--sampling-method", "euler",
-           "--steps", str(prm["steps"]), "-W", str(prm["w"]), "-H", str(prm["h"]), "-s", str(prm["seed"]),
-           "--diffusion-fa", "-o", str(out), "-v",
-           # Qwen 2.1 的 VAE 是 3D 卷积，M2 上 Metal 实现很慢，放 CPU 快 3 倍且结果一致
-           "--backend", "vae=cpu"]
-    if prm["negative"]:
-        cmd += ["-n", prm["negative"]]
-    if req.get("lowmem", True):
-        cmd += ["--params-backend", "te=disk"]
+    lowmem = bool(req.get("lowmem", True))
+    if load_json(SETTINGS, {}).get("lowmem", True) != lowmem:  # 记住，下次打开按这个预载
+        update_settings(lambda st: st.__setitem__("lowmem", lowmem))
     fast = bool(req.get("fast", False))
-    if fast:  # EasyCache：相邻步变化小时跳过计算
-        cmd += ["--cache-mode", "easycache"]
-    ref_name = None
+    body = {"prompt": prm["prompt"], "negative_prompt": prm["negative"], "width": prm["w"], "height": prm["h"],
+            "seed": prm["seed"], "output_format": "png",
+            "sample_params": {"sample_method": "euler", "sample_steps": prm["steps"],
+                              "guidance": {"txt_cfg": prm["cfg"]}},
+            # EasyCache：相邻步变化小时跳过计算
+            "cache_mode": "easycache" if fast else "disabled"}
     if ref_img:
-        ref_path = TMP / f"ref_{stamp}.{ref_img[0]}"
-        ref_path.write_bytes(ref_img[1])
-        ref_name = ref_path.name
-        cmd += ["--llm_vision", str(MODELS / sel["vision"]), "-r", str(ref_path)]
+        body["ref_images"] = [base64.b64encode(ref_img[1]).decode()]
     record = {"file": str(out), "name": out.name, "prompt": prm["prompt"], "negative": prm["negative"],
-              "size": prm["size"], "steps": prm["steps"], "cfg": prm["cfg"], "seed": prm["seed"], "ref": ref_name,
+              "size": prm["size"], "steps": prm["steps"], "cfg": prm["cfg"], "seed": prm["seed"], "ref": bool(ref_img),
               "fast": fast, "time": stamp, "dit": Path(sel["dit"]).name, "te": Path(sel["te"]).name}
-    threading.Thread(target=gen_worker, args=(cmd, record), daemon=True).start()
+    threading.Thread(target=sd_worker, args=(sel, lowmem, body, record), daemon=True).start()
     return None
 
 
@@ -753,7 +924,7 @@ def start_generate_mlx(req, sel):
     record = {"file": str(out), "name": out.name, "prompt": prm["prompt"], "negative": prm["negative"],
               "size": prm["size"], "steps": prm["steps"], "cfg": prm["cfg"], "seed": prm["seed"], "ref": None,
               "fast": False, "time": stamp, "engine": "mlx", "dit": Path(sel["mlx"]).name}
-    threading.Thread(target=mlx_worker, args=(req, record, sel["mlx"]), daemon=True).start()
+    threading.Thread(target=mlx_worker, args=(record, sel["mlx"]), daemon=True).start()
     return None
 
 
@@ -762,7 +933,7 @@ def cancel_generate():
         return
     job["cancelled"] = True  # 进程还没起来时，由工作线程启动后自己检查
     p = job.get("proc")
-    if p and p.poll() is None:
+    if p and p.poll() is None:  # 引擎没法中途打断一张图，只能关掉，之后在后台重新预载
         os.killpg(p.pid, signal.SIGTERM)
 
 
@@ -799,7 +970,7 @@ def status():
     if job["running"] and job["spi"] and job["total"]:
         eta = round((job["total"] - job["step"]) * job["spi"])
     return {
-        "engine": bool(sd_cli()),
+        "engine": bool(sd_server()),
         "mlx_engine": bool(mlx_serve()),
         "models": inv,
         "sel": selection(inv),
@@ -809,6 +980,7 @@ def status():
                   "log": job["log"][-80:]},
         "mem": avail_mem_gb(),
         "disk": round(shutil.disk_usage(ROOT).free / 2**30, 1),
+        "warm": warm_state(),
     }
 
 
@@ -882,12 +1054,14 @@ class H(BaseHTTPRequestHandler):
                 role, f = req.get("role"), req.get("file")
                 if role in ("dit", "te", "vae", "vision", "mlx", "engine"):
                     update_settings(lambda st: st.setdefault("sel", {}).__setitem__(role, f))
+                    schedule_preload()
             elif path == "/api/model/role":
                 rel, role = req.get("file"), req.get("role")
                 if role in ROLES and inside(MODELS, rel):
                     update_settings(lambda st: st.setdefault("roles", {}).__setitem__(rel, role))
             elif path == "/api/model/delete":
                 delete_model(req.get("file", ""))
+                schedule_preload()
             elif path == "/api/history/delete":
                 delete_output(req.get("name", ""))
             elif path == "/api/reveal":
@@ -897,6 +1071,7 @@ class H(BaseHTTPRequestHandler):
                 self.send(200, {"ok": True})
                 stop_for_quit()
                 cancel_generate()
+                stop_engine()
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
             else:
@@ -922,11 +1097,14 @@ def main():
         return
     if any(t["status"] == "queued" for t in ts):
         kick_worker()
+    kill_stale_engine()
+    schedule_preload(0)
     if os.environ.get("QWEN_NO_BROWSER") != "1":
         threading.Timer(0.5, webbrowser.open, args=(url,)).start()
     def on_term(*_):
         stop_for_quit()
         cancel_generate()
+        stop_engine()
         raise SystemExit(0)
     signal.signal(signal.SIGTERM, on_term)
     print("Qwen 生图已启动：", url, flush=True)
