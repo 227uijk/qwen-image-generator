@@ -56,7 +56,7 @@ python3 app.py      # 会自动打开 http://127.0.0.1:7861
 
 ### 发布新版本
 
-推送 `v*` 标签（如 `git tag v1.1 && git push origin v1.1`），GitHub Actions 会在 macOS 上打包并发布到 Releases。
+推送 `v*` 标签（如 `git tag v1.1 && git push origin v1.1`），或在 Actions 页面手动运行「Release」并填上标签，GitHub Actions 会在 macOS 上打包并发布到 Releases。
 
 ## 下载模型
 
