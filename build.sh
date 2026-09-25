@@ -39,7 +39,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <key>CFBundleExecutable</key><string>QwenImage</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>$VERSION</string>
+<key>CFBundleShortVersionString</key><string>${VERSION}</string>
 <key>LSMinimumSystemVersion</key><string>15.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
@@ -47,5 +47,5 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 
 codesign --force -s - "$APP"
-echo "✓ 完成：双击「$APP」启动"
+echo "✓ 完成：双击「${APP}」启动"
 echo "  放在仓库里时用仓库里的 app.py 和数据；单独拷走则用自带的代码，数据在 ~/Library/Application Support/QwenImage"
