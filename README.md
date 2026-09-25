@@ -20,10 +20,22 @@
 | 芯片 | Apple Silicon（M1 及以后） |
 | 内存 | 16 GB 起（4bit 模型、512 分辨率） |
 | 系统 | macOS 15 或更新（用到系统自带的 `trash` 命令） |
-| 工具 | Xcode 命令行工具（`xcode-select --install`），自带 Python 3.9 与 Swift 编译器 |
+| 工具 | Python 3（系统自带的 `/usr/bin/python3` 即可，第一次运行若提示安装「命令行开发者工具」点安装就行）；自己构建还需要 Swift 编译器（同在 `xcode-select --install` 里） |
 | 磁盘 | 基础套装约 11 GB |
 
 ## 安装
+
+### 直接下载（推荐）
+
+1. 到 [Releases](https://github.com/227uijk/qwen-image-generator/releases) 下载最新的 `QwenImage-macOS-arm64.zip`，解压得到 **`Qwen 生图.app`**，拖进「应用程序」
+2. 这个 app 没有 Apple 开发者签名，第一次打开会被系统拦下。任选一种放行：
+   - 双击一次被拦后，去「系统设置 → 隐私与安全性」，在下面点「仍要打开」
+   - 或在终端执行 `xattr -dr com.apple.quarantine "/Applications/Qwen 生图.app"`
+3. 如果弹出「需要安装命令行开发者工具」，点安装（app 用的是系统的 Python 3），装完重新打开
+
+模型、生成的图片、设置都存在 `~/Library/Application Support/QwenImage`，升级 app 时直接覆盖即可，数据不受影响。
+
+### 从源码构建
 
 ```bash
 git clone https://github.com/227uijk/qwen-image-generator.git
@@ -31,15 +43,20 @@ cd qwen-image-generator
 ./build.sh
 ```
 
-然后双击生成的 **`Qwen 生图.app`**。第一次打开时，macOS 可能会询问能否访问所在文件夹，点「允许」。
+然后双击生成的 **`Qwen 生图.app`**。
 
-`.app` 启动时会在它**所在的文件夹**里找 `app.py`，所以整个文件夹要放在一起；想放进程序坞，直接把 `.app` 拖到程序坞即可。
+- `.app` **留在仓库文件夹里**时，它会用旁边的 `app.py`、`index.html`，数据也存在仓库文件夹里（改代码不用重新打包，适合开发）
+- **单独拷走**时，它用打包进去的代码，数据放 `~/Library/Application Support/QwenImage`，和下载版一样
 
 也可以不打包，直接在浏览器里用：
 
 ```bash
 python3 app.py      # 会自动打开 http://127.0.0.1:7861
 ```
+
+### 发布新版本
+
+推送 `v*` 标签（如 `git tag v1.1 && git push origin v1.1`），GitHub Actions 会在 macOS 上打包并发布到 Releases。
 
 ## 下载模型
 
@@ -103,9 +120,11 @@ outputs/          生成的图片
 
 运行时状态保存在 `settings.json`（选中的模型）、`history.json`（历史）、`downloads.json`（下载队列），都已加入 `.gitignore`。
 
+`models/`、`bin/`、`outputs/` 和这些状态文件所在的「数据目录」：从源码直接运行时就是仓库文件夹；独立运行的 `.app` 是 `~/Library/Application Support/QwenImage`（也可以用环境变量 `QWEN_DATA_DIR` 指定）。
+
 ## 常见问题
 
-**打开后界面一直空白？** 看同目录的 `app.log`。多半是第一次运行时没有允许访问文件夹，或者 7861 端口被占用。
+**打开后界面一直空白？** 看数据目录里的 `app.log`（下载版在 `~/Library/Application Support/QwenImage/app.log`）。多半是还没装命令行开发者工具（没有 Python 3）、第一次运行时没有允许访问文件夹，或者 7861 端口被占用。
 
 **提示内存不足、生成失败？** 关掉浏览器、聊天客户端等占内存的软件；16 GB 机器建议先用 512 分辨率。
 

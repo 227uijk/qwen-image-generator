@@ -5,8 +5,16 @@ import WebKit
 // 和 app.py 一样读 QWEN_PORT，默认 7861
 let port = Int(ProcessInfo.processInfo.environment["QWEN_PORT"] ?? "") ?? 7861
 let url = URL(string: "http://127.0.0.1:\(port)/")!
-// .app 所在的目录就是工具根目录（app.py 在这里）
-let root = Bundle.main.bundleURL.deletingLastPathComponent()
+// 两种布局：
+// - 开发模式：.app 旁边有 app.py（从仓库 ./build.sh 出来的），代码和数据都用那个文件夹，和以前一样
+// - 独立模式：用打包进 .app 的 app.py，数据放 ~/Library/Application Support/QwenImage
+let beside = Bundle.main.bundleURL.deletingLastPathComponent()
+let devMode = FileManager.default.fileExists(atPath: beside.appendingPathComponent("app.py").path)
+let codeDir = devMode ? beside : Bundle.main.resourceURL!
+let dataDir: URL = devMode ? beside : FileManager.default
+    .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    .appendingPathComponent("QwenImage", isDirectory: true)
+let logURL = dataDir.appendingPathComponent("app.log")
 
 final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKScriptMessageHandler, NSWindowDelegate {
     var window: NSWindow!
@@ -41,12 +49,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKScript
         let py = ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"]
             .first { FileManager.default.isExecutableFile(atPath: $0) } ?? "/usr/bin/python3"
         p.executableURL = URL(fileURLWithPath: py)
-        p.arguments = [root.appendingPathComponent("app.py").path]
-        p.currentDirectoryURL = root
+        try? FileManager.default.createDirectory(at: dataDir, withIntermediateDirectories: true)
+        p.arguments = [codeDir.appendingPathComponent("app.py").path]
+        p.currentDirectoryURL = dataDir
         var env = ProcessInfo.processInfo.environment
         env["QWEN_NO_BROWSER"] = "1"
+        env["QWEN_DATA_DIR"] = dataDir.path
         p.environment = env
-        let logURL = root.appendingPathComponent("app.log")
         if !FileManager.default.fileExists(atPath: logURL.path) {
             FileManager.default.createFile(atPath: logURL.path, contents: nil)
         }
@@ -72,7 +81,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKScript
                     if tries % 8 == 7, !(self.server?.isRunning ?? false) { self.startServer() }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { self.waitAndLoad(tries: tries + 1) }
                 } else {
-                    self.web.loadHTMLString("<p style='font:15px -apple-system;padding:40px'>后台服务没能启动，请查看 app.log。</p>", baseURL: nil)
+                    self.web.loadHTMLString("<p style='font:15px -apple-system;padding:40px'>后台服务没能启动，请查看 \(logURL.path)。<br>如果系统提示安装“命令行开发者工具”，装好后重新打开即可（需要其中的 Python 3）。</p>", baseURL: nil)
                 }
             }
         }.resume()

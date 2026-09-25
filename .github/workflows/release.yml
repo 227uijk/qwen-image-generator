@@ -1,0 +1,38 @@
+# 推送 v* 标签时在 Apple Silicon runner 上打包 .app，压缩后发布到 Releases
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build app
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then export VERSION="${GITHUB_REF_NAME#v}"; else export VERSION="0.0-dev"; fi
+          ./build.sh
+
+      - name: Zip
+        run: ditto -c -k --sequesterRsrc --keepParent "Qwen 生图.app" QwenImage-macOS-arm64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: QwenImage-macOS-arm64
+          path: QwenImage-macOS-arm64.zip
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" QwenImage-macOS-arm64.zip \
+            --title "$GITHUB_REF_NAME" --generate-notes

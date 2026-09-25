@@ -19,7 +19,10 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 PORT = int(os.environ.get("QWEN_PORT", "7861"))
-ROOT = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parent  # 代码所在目录（index.html 在这里）
+# 数据目录：模型、引擎、生成结果、状态文件。.app 独立运行时由启动器指到 ~/Library/Application Support
+ROOT = Path(os.environ.get("QWEN_DATA_DIR") or HERE)
+ROOT.mkdir(parents=True, exist_ok=True)
 BIN = ROOT / "bin"
 MODELS = ROOT / "models"
 OUT = ROOT / "outputs"
@@ -1042,7 +1045,7 @@ class H(BaseHTTPRequestHandler):
             return self.send(403, {"error": "forbidden"})
         path = unquote(urlparse(self.path).path)
         if path == "/":
-            return self.send(200, (ROOT / "index.html").read_bytes(), "text/html; charset=utf-8")
+            return self.send(200, (HERE / "index.html").read_bytes(), "text/html; charset=utf-8")
         if path == "/api/status":
             return self.send(200, status())
         if path == "/api/meta":

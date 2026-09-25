@@ -5,6 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP="Qwen 生图.app"
+VERSION="${VERSION:-1.0}"
 BUILD="launcher/.build"
 mkdir -p "$BUILD"
 
@@ -26,7 +27,9 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BUILD/QwenImage" "$APP/Contents/MacOS/QwenImage"
 cp "$BUILD/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+# 把界面和后端也打进去，这样单独拷走 .app 也能用（数据放 ~/Library/Application Support/QwenImage）
+cp app.py index.html "$APP/Contents/Resources/"
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -36,7 +39,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <key>CFBundleExecutable</key><string>QwenImage</string>
 <key>CFBundleIconFile</key><string>AppIcon</string>
 <key>CFBundlePackageType</key><string>APPL</string>
-<key>CFBundleShortVersionString</key><string>1.0</string>
+<key>CFBundleShortVersionString</key><string>$VERSION</string>
 <key>LSMinimumSystemVersion</key><string>15.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
@@ -44,4 +47,5 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 PLIST
 
 codesign --force -s - "$APP"
-echo "✓ 完成：双击「$APP」启动（它会在同目录下找 app.py，整个文件夹要放在一起）"
+echo "✓ 完成：双击「$APP」启动"
+echo "  放在仓库里时用仓库里的 app.py 和数据；单独拷走则用自带的代码，数据在 ~/Library/Application Support/QwenImage"
