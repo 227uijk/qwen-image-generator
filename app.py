@@ -312,6 +312,7 @@ def postprocess(t):
             f.chmod(0o755)
     subprocess.run(["xattr", "-dr", "com.apple.quarantine", str(BIN)], capture_output=True)
     to_trash(d)
+    schedule_preload()  # 模型常驻着的话换成新程序
 
 
 def run_task(t):
@@ -625,7 +626,9 @@ def start_engine(key, argv, health, pump):
 
 
 def sd_key(sel, lowmem):
-    return ("sd", sel["dit"], sel["te"], sel["vae"], sel["vision"], bool(lowmem))
+    # 带上程序路径：更新 sd.cpp 后下次生成自动换成新版
+    exe = sd_server()
+    return ("sd", str(exe), exe and exe.stat().st_mtime, sel["dit"], sel["te"], sel["vae"], sel["vision"], bool(lowmem))
 
 
 def ensure_sd(sel, lowmem, warm=False):
