@@ -106,7 +106,7 @@ CFG 大于 1 时每步要算两遍，时间约翻倍。Qwen-Image 2.1 官方默�
 
 ## 两个引擎
 
-**sd.cpp（默认）**：支持文生图和指令编辑，参数最全。新版（master-911 起）有 Qwen 2.1 的 prefix cache：提示词和参考图的 K/V 只在第一步算一次，开了 flash attention 时以 FP16 存，图生图受益最明显。工具里对它做了一处关键优化：Qwen 2.1 的 VAE 是 3D 卷积结构，在 Apple GPU 上很慢，所以强制放到 CPU 上解码（`--backend vae=cpu`），512 图的解码从约 110 秒降到约 35 秒，输出与 GPU 解码一致。
+**sd.cpp（默认）**：支持文生图和指令编辑，参数最全。新版（master-911 起）有 Qwen 2.1 的 prefix cache：提示词和参考图的 K/V 只在第一步算一次，开了 flash attention 时以 FP16 存，图生图受益最明显。另外开了 `--mmap`：新版能把 mmap 的权重直接包成 Metal buffer，生图模型不再在内存里多复制一份；这些页是文件映射的，内存紧张时系统可以直接丢弃再从磁盘读回，而不是写进 swap。工具里对它做了一处关键优化：Qwen 2.1 的 VAE 是 3D 卷积结构，在 Apple GPU 上很慢，所以强制放到 CPU 上解码（`--backend vae=cpu`），512 图的解码从约 110 秒降到约 35 秒，输出与 GPU 解码一致。
 
 **MLX-Serve（实验）**：需要在预设里下载「MLX 引擎套装」（程序 72 MB + 模型包 10.7 GB）。关闭了它在 16 GB 机器上过于保守的内存检查（`--max-resident-mem 0 --skip-mem-preflight`）。目前 MLX-Serve 的 Qwen 2.1 **不支持指令编辑**，放参考图时请切回 sd.cpp；省内存和加速开关对它无效。
 

@@ -640,6 +640,8 @@ def ensure_sd(sel, lowmem, warm=False):
              "--llm", str(MODELS / sel["te"]),
              "--sampling-method", "euler", "--diffusion-fa", "-v",
              "--lora-model-dir", str(MODELS),
+             # 权重直接映射成 Metal buffer（零拷贝），不再在内存里另存一份；映射失败时 sd.cpp 自动回退为普通加载
+             "--mmap",
              # Qwen 2.1 的 VAE 是 3D 卷积，M2 上 Metal 实现很慢，放 CPU 快 3 倍且结果一致
              "--backend", "vae=cpu"]
         if sel["vision"]:  # 权重按需加载，不放参考图时不占内存
