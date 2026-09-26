@@ -3,6 +3,7 @@
 
 import base64
 import json
+import math
 import os
 import re
 import shutil
@@ -34,22 +35,28 @@ for d in (BIN, MODELS, OUT, TMP):
     d.mkdir(exist_ok=True)
 
 ROLES = {"dit": "生图模型", "te": "文本编码器", "vae": "VAE", "vision": "视觉组件",
-         "engine": "sd.cpp 程序", "mlx": "MLX 模型包（整个仓库）", "mlx_engine": "MLX-Serve 程序",
+         "lora": "LoRA", "engine": "sd.cpp 程序", "mlx": "MLX 模型包（整个仓库）", "mlx_engine": "MLX-Serve 程序",
          "other": "其他（仅下载）"}
 MODEL_EXT = (".gguf", ".safetensors")
 
 # 推荐预设：只是帮忙填好链接，用户也可以自己贴任意链接
 HF = "https://huggingface.co"
+SD_ENGINE = ("https://github.com/leejet/stable-diffusion.cpp/releases/download/"
+             "master-920-2f88688/sd-master-2f88688-bin-Darwin-macOS-26.6.2-arm64.zip")
 PRESETS = [
     {"name": "Qwen-Image 2.1 基础套装", "desc": "sd.cpp 程序 + 4bit 模型 + VAE + 视觉组件，约 10.7 GB，16 GB Mac 可用",
      "items": [
-         {"role": "engine", "url": "https://github.com/leejet/stable-diffusion.cpp/releases/download/"
-                                   "master-900-c92d73c/sd-master-c92d73c-bin-Darwin-macOS-26.6.2-arm64.zip"},
+         {"role": "engine", "url": SD_ENGINE},
          {"role": "vae", "url": f"{HF}/Comfy-Org/Qwen-Image-2.1/resolve/main/vae/qwen_image_2.1_vae_bf16.safetensors"},
          {"role": "dit", "url": f"{HF}/leejet/Qwen-Image-2.1-GGUF/resolve/main/qwen_image_2.1-Q4_K.gguf"},
          {"role": "te", "url": f"{HF}/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/main/Qwen3VL-8B-Instruct-Q4_K_M.gguf"},
          {"role": "vision", "url": f"{HF}/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/main/mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf"},
      ]},
+    {"name": "Viggle Turbo 6 步加速", "desc": "蒸馏 LoRA 680 MB，6 步出图、不用 CFG，文生图和指令编辑都能用",
+     "items": [{"role": "lora", "url": f"{HF}/Viggle/Qwen-Image-2.1-viggle-turbo/resolve/main/"
+                                       "Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors"}]},
+    {"name": "更新 sd.cpp 程序", "desc": "装过旧版的点这个：带 prefix cache、修正采样调度和 VAE，LoRA 需要新版",
+     "items": [{"role": "engine", "url": SD_ENGINE}]},
     {"name": "生图模型 Q8_0（高质量）", "desc": "7.7 GB，细节和手部更好，多占约 3 GB 内存",
      "items": [{"role": "dit", "url": f"{HF}/leejet/Qwen-Image-2.1-GGUF/resolve/main/qwen_image_2.1-Q8_0.gguf"}]},
     {"name": "生图模型 Q6_K", "desc": "6.0 GB，介于 Q4 和 Q8 之间",
@@ -127,10 +134,9 @@ def avail_mem_gb():
 
 
 def sd_server():
-    for p in BIN.rglob("sd-server"):
-        if p.is_file() and os.access(p, os.X_OK):
-            return p
-    return None
+    # 更新程序后旧版可能还留在 bin/ 里，用最新的那个
+    found = [p for p in BIN.rglob("sd-server") if p.is_file() and os.access(p, os.X_OK)]
+    return max(found, key=lambda p: p.stat().st_mtime) if found else None
 
 
 def mlx_serve():
@@ -151,6 +157,8 @@ def infer_role(rel):
         if (parent / "model_index.json").exists() or (parent / "config.json").exists():
             return "other"
     n = p.name.lower()
+    if "lora" in n:
+        return "lora"
     if "mmproj" in n:
         return "vision"
     if "vae" in n:
@@ -199,6 +207,9 @@ def selection(inv=None):
     for role in ("dit", "te", "vae", "vision", "mlx"):
         files = [i["file"] for i in inv if i["role"] == role]
         sel[role] = saved.get(role) if saved.get(role) in files else (files[0] if files else None)
+    # LoRA 是可选的，不自动选第一个
+    loras = [i["file"] for i in inv if i["role"] == "lora"]
+    sel["lora"] = saved.get("lora") if saved.get("lora") in loras else None
     sel["engine"] = saved.get("engine") if saved.get("engine") in ("sd", "mlx") else "sd"
     return sel
 
@@ -417,7 +428,7 @@ def add_download(url, role, name, source):
                        "name": Path(dest).name, "status": "queued", "error": None, "source": source})
             added += 1
         save_tasks(ts)
-    if role in ("dit", "te", "vae", "vision"):
+    if role in ("dit", "te", "vae", "vision", "lora"):
         update_settings(lambda st: [st.setdefault("roles", {}).__setitem__(str(Path(d).relative_to("models")), role)
                                     for _, d, _ in entries if d.startswith("models/")])
     kick_worker()
@@ -628,6 +639,7 @@ def ensure_sd(sel, lowmem, warm=False):
              "--vae", str(MODELS / sel["vae"]),
              "--llm", str(MODELS / sel["te"]),
              "--sampling-method", "euler", "--diffusion-fa", "-v",
+             "--lora-model-dir", str(MODELS),
              # Qwen 2.1 的 VAE 是 3D 卷积，M2 上 Metal 实现很慢，放 CPU 快 3 倍且结果一致
              "--backend", "vae=cpu"]
         if sel["vision"]:  # 权重按需加载，不放参考图时不占内存
@@ -861,6 +873,23 @@ def mlx_worker(record, pack):
 
 # ---------- 生成 ----------
 
+# 蒸馏加速 LoRA 训练时用的 sigma 节点：文件名含 key 的 LoRA 固定按这些节点采样、不开 CFG
+TURBO = {"viggle-turbo-v0.2.1-6step": [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25]}
+
+
+def turbo_nodes(lora):
+    n = Path(lora or "").name.lower()
+    return next((v for k, v in TURBO.items() if k in n), None)
+
+
+def turbo_sigmas(nodes, w, h):
+    """按分辨率做 Qwen 2.1 的 flow shift（与 sd.cpp 默认调度同一公式，但不做 terminal shift），末尾补 0。"""
+    seq = (w // 16) * (h // 16)
+    mu = 0.5 + (0.9 - 0.5) / (8192 - 256) * (seq - 256)
+    shift = lambda t: 1.0 if t >= 1 else math.exp(mu) / (math.exp(mu) + (1 / t - 1))
+    return [round(shift(t), 6) for t in nodes] + [0.0]
+
+
 def parse_params(req):
     """校验并解析生成参数；出错抛 ValueError，此时任务还没占用。"""
     prompt = (req.get("prompt") or "").strip()
@@ -924,17 +953,26 @@ def start_generate(req):
     if load_json(SETTINGS, {}).get("lowmem", True) != lowmem:  # 记住，下次打开按这个预载
         update_settings(lambda st: st.__setitem__("lowmem", lowmem))
     fast = bool(req.get("fast", False))
+    nodes = turbo_nodes(sel["lora"])
+    if nodes:  # 蒸馏过的 LoRA：步数、CFG 由它决定，反向提示词和 EasyCache 都用不上
+        prm.update(steps=len(nodes), cfg=1.0, negative="")
+        fast = False
     body = {"prompt": prm["prompt"], "negative_prompt": prm["negative"], "width": prm["w"], "height": prm["h"],
             "seed": prm["seed"], "output_format": "png",
             "sample_params": {"sample_method": "euler", "sample_steps": prm["steps"],
                               "guidance": {"txt_cfg": prm["cfg"]}},
             # EasyCache：相邻步变化小时跳过计算
             "cache_mode": "easycache" if fast else "disabled"}
+    if sel["lora"]:
+        body["lora"] = [{"path": sel["lora"], "multiplier": 1.0}]
+    if nodes:
+        body["sample_params"]["custom_sigmas"] = turbo_sigmas(nodes, prm["w"], prm["h"])
     if ref_img:
         body["ref_images"] = [base64.b64encode(ref_img[1]).decode()]
     record = {"file": str(out), "name": out.name, "prompt": prm["prompt"], "negative": prm["negative"],
               "size": prm["size"], "steps": prm["steps"], "cfg": prm["cfg"], "seed": prm["seed"], "ref": bool(ref_img),
-              "fast": fast, "time": stamp, "dit": Path(sel["dit"]).name, "te": Path(sel["te"]).name}
+              "fast": fast, "time": stamp, "dit": Path(sel["dit"]).name, "te": Path(sel["te"]).name,
+              "lora": Path(sel["lora"]).stem if sel["lora"] else None}
     threading.Thread(target=sd_worker, args=(sel, lowmem, body, record), daemon=True).start()
     return None
 
@@ -1005,7 +1043,8 @@ def status():
         "engine": bool(sd_server()),
         "mlx_engine": bool(mlx_serve()),
         "models": inv,
-        "sel": selection(inv),
+        "sel": (sel := selection(inv)),
+        "turbo": len(turbo_nodes(sel["lora"]) or []),
         "tasks": task_view(),
         "job": {k: job[k] for k in ("running", "stage", "step", "total", "spi", "error", "output")}
                | {"eta": eta, "elapsed": round(time.time() - job["started"]) if job["started"] else 0,
@@ -1088,7 +1127,7 @@ class H(BaseHTTPRequestHandler):
                 task_action(req.get("id"), req.get("action"))
             elif path == "/api/select":
                 role, f = req.get("role"), req.get("file")
-                if role in ("dit", "te", "vae", "vision", "mlx", "engine"):
+                if role in ("dit", "te", "vae", "vision", "mlx", "lora", "engine"):
                     update_settings(lambda st: st.setdefault("sel", {}).__setitem__(role, f))
                     schedule_preload()  # 模型已加载着的话换成新选的
             elif path == "/api/model/role":

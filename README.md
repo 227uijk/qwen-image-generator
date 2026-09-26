@@ -9,7 +9,8 @@
 - **文生图 + 指令编辑**：放一张参考图，再写「把猫换成黑猫」这类指令就能改图
 - **两个引擎**：[stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)（默认，功能全）和 [MLX-Serve](https://github.com/ddalcu/mlx-serve)（实验，文生图更快）
 - **模型管理**：贴链接下载任意模型（单个文件或整个 Hugging Face 仓库），断点续传，可切换国内镜像；自带推荐预设
-- **切换模型**：生图模型、文本编码器、VAE、视觉组件各自可选，方便对比 Q4 / Q8 等不同量化
+- **切换模型**：生图模型、文本编码器、VAE、视觉组件、LoRA 各自可选，方便对比 Q4 / Q8 等不同量化
+- **6 步加速**：可选 Viggle Turbo 蒸馏 LoRA，自动套用它训练时的 sigma 节点，12 步的活 6 步干完
 - **历史记录**：胶片条浏览、复用参数、当参考图继续改、删除（移到废纸篓）
 - **零依赖**：后端只用 Python 标准库，界面是系统自带的 WebKit，不需要 pip / npm / Chrome
 
@@ -64,11 +65,13 @@ python3 app.py      # 会自动打开 http://127.0.0.1:7861
 
 | 文件 | 用途 | 大小 |
 |---|---|---|
-| sd.cpp 程序（macOS arm64） | 推理引擎 | 34 MB |
+| sd.cpp 程序（macOS arm64） | 推理引擎 | 33 MB |
 | `qwen_image_2.1-Q4_K.gguf` | 生图模型（DiT，4bit） | 4.2 GB |
 | `Qwen3VL-8B-Instruct-Q4_K_M.gguf` | 文本编码器 | 5.0 GB |
 | `qwen_image_2.1_vae_bf16.safetensors` | VAE | 0.7 GB |
 | `mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf` | 视觉组件（指令编辑需要） | 0.75 GB |
+
+想更快，再点 **Viggle Turbo 6 步加速**（680 MB），然后在左侧「LoRA」里选上它。之前装过旧版 sd.cpp 的，先点一次 **更新 sd.cpp 程序**（旧版加载不全 Qwen 2.1 的 LoRA）。
 
 也可以把任意下载链接贴进「添加下载」：单个文件链接、`/blob/` 页面链接、或整个 Hugging Face 仓库地址都行。下载源可选 Hugging Face 原站（走系统代理）或国内镜像 hf-mirror。关掉工具后，未完成的任务下次打开会自动续传。
 
@@ -80,7 +83,8 @@ python3 app.py      # 会自动打开 http://127.0.0.1:7861
 
 | 场景 | 建议 |
 |---|---|
-| 日常出图 | 512×512 或 512×768，**12 步**，CFG 1，不开加速 |
+| 日常出图 | 512×512 或 512×768，**12 步**，CFG 1，不开加速；或选上 Turbo LoRA，固定 6 步 |
+| Turbo LoRA | 步数、CFG 自动锁定（6 步、CFG 1），反向提示词和 EasyCache 不生效；构图和原模型基本一致，细微纹理会差一点 |
 | 定稿 | 20 步以上；想要手部、文字更好用 CFG 3（时间翻倍）并填反向提示词 |
 | 写实人像的手 | CFG 3 + 反向提示词「畸形的手, 多余的手指, 手指粘连」；Q8 模型更好 |
 | 省内存模式 | 16 GB 机器保持开启（文本编码器从磁盘读，用完即释放） |
@@ -96,11 +100,13 @@ python3 app.py      # 会自动打开 http://127.0.0.1:7861
 
 总耗时里还包含编码提示词和 VAE 解码，这部分与步数无关。第一张图另外还要加载模型，之后就不用了（见下方「模型常驻」）。
 
-CFG 大于 1 时每步要算两遍，时间约翻倍。
+CFG 大于 1 时每步要算两遍，时间约翻倍。Qwen-Image 2.1 官方默认就是不开 CFG（= 1）；注意 CFG 填 0 不是「关闭」，按公式会只剩无条件分支、完全无视提示词。
+
+上表是旧版 sd.cpp（master-900）的数据，Turbo LoRA 和新版引擎的速度还没在 16 GB 机器上重测。
 
 ## 两个引擎
 
-**sd.cpp（默认）**：支持文生图和指令编辑，参数最全。工具里对它做了一处关键优化：Qwen 2.1 的 VAE 是 3D 卷积结构，在 Apple GPU 上很慢，所以强制放到 CPU 上解码（`--backend vae=cpu`），512 图的解码从约 110 秒降到约 35 秒，输出与 GPU 解码一致。
+**sd.cpp（默认）**：支持文生图和指令编辑，参数最全。新版（master-911 起）有 Qwen 2.1 的 prefix cache：提示词和参考图的 K/V 只在第一步算一次，开了 flash attention 时以 FP16 存，图生图受益最明显。工具里对它做了一处关键优化：Qwen 2.1 的 VAE 是 3D 卷积结构，在 Apple GPU 上很慢，所以强制放到 CPU 上解码（`--backend vae=cpu`），512 图的解码从约 110 秒降到约 35 秒，输出与 GPU 解码一致。
 
 **MLX-Serve（实验）**：需要在预设里下载「MLX 引擎套装」（程序 72 MB + 模型包 10.7 GB）。关闭了它在 16 GB 机器上过于保守的内存检查（`--max-resident-mem 0 --skip-mem-preflight`）。目前 MLX-Serve 的 Qwen 2.1 **不支持指令编辑**，放参考图时请切回 sd.cpp；省内存和加速开关对它无效。
 
@@ -142,3 +148,4 @@ outputs/          生成的图片
 - [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) 与 [leejet/Qwen-Image-2.1-GGUF](https://huggingface.co/leejet/Qwen-Image-2.1-GGUF)
 - [MLX-Serve](https://github.com/ddalcu/mlx-serve) 与 [ddalcu/Qwen-Image-2.1-MLX-Serve-4bit](https://huggingface.co/ddalcu/Qwen-Image-2.1-MLX-Serve-4bit)
 - [Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1)（VAE）
+- [Viggle/Qwen-Image-2.1-viggle-turbo](https://huggingface.co/Viggle/Qwen-Image-2.1-viggle-turbo)（6 步加速 LoRA）

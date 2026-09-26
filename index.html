@@ -211,6 +211,7 @@
           <label>文本编码</label><select id="sel_te" data-role="te"></select>
           <label>VAE</label><select id="sel_vae" data-role="vae"></select>
           <label>视觉组件</label><select id="sel_vision" data-role="vision"></select>
+          <label>LoRA</label><select id="sel_lora" data-role="lora"></select>
         </div>
         <div class="msel" id="mlxSel" hidden>
           <label>模型包</label><select id="sel_mlx" data-role="mlx"></select>
@@ -233,7 +234,7 @@
             <select id="cfg">
               <option value="1">1 · 最快</option>
               <option value="3">3 · 手部/文字更好</option>
-              <option value="6">6 · 官方示例</option>
+              <option value="6">6 · sd.cpp 示例</option>
             </select></div>
           <div class="field"><label>种子（-1 随机）</label><input id="seed" type="number" value="-1"></div>
         </div>
@@ -330,7 +331,7 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') drawer(false
 // ---------- 模型选择 / 管理 ----------
 let lastModelsKey = '';
 function renderModels(s) {
-  const key = JSON.stringify([s.models, s.sel, s.engine]);
+  const key = JSON.stringify([s.models, s.sel, s.engine, s.turbo]);
   if (key === lastModelsKey) return;
   lastModelsKey = key;
   for (const role of ['dit', 'te', 'vae', 'vision', 'mlx']) {
@@ -340,14 +341,21 @@ function renderModels(s) {
       : '<option value="">（没有，去「管理」下载）</option>';
     el.disabled = !files.length;
   }
+  const loras = s.models.filter(m => m.role === 'lora');  // 可选：总有「不用」
+  $('sel_lora').innerHTML = '<option value="">不用</option>'
+    + loras.map(m => `<option value="${esc(m.file)}" ${m.file === s.sel.lora ? 'selected' : ''}>${esc(m.file)}</option>`).join('');
+  $('sel_lora').disabled = !loras.length;
+  // 蒸馏加速 LoRA 自带步数，且不开 CFG
+  $('steps').disabled = $('cfg').disabled = !!s.turbo && s.sel.engine !== 'mlx';
   $('engineState').textContent = (s.engine ? 'sd.cpp ✓' : 'sd.cpp 未安装') + ' · ' + (s.mlx_engine ? 'MLX ✓' : 'MLX 未安装');
   const mlx = s.sel.engine === 'mlx';
   document.querySelectorAll('#engineSeg button').forEach(b => b.classList.toggle('on', b.dataset.e === s.sel.engine));
   $('sdSel').hidden = mlx; $('mlxSel').hidden = !mlx;
   $('engineHint').textContent = mlx
     ? (s.mlx_engine ? 'MLX 引擎：苹果 MLX 框架，不支持参考图；省内存 / 加速开关对它无效。' : 'MLX-Serve 程序还没装，去「管理」下载「MLX 引擎套装」。')
-    : (s.engine ? '' : 'sd.cpp 程序还没装，去「管理」下载「基础套装」。');
-  const order = ['dit', 'te', 'vae', 'vision', 'mlx', 'other'];
+    : !s.engine ? 'sd.cpp 程序还没装，去「管理」下载「基础套装」。'
+    : s.turbo ? `加速 LoRA：固定 ${s.turbo} 步、CFG 1，步数 / CFG / 反向提示词 / EasyCache 不生效。` : '';
+  const order = ['dit', 'te', 'vae', 'vision', 'lora', 'mlx', 'other'];
   const roleOpts = cur => order.map(r => `<option value="${r}" ${r === cur ? 'selected' : ''}>${esc(meta.roles[r] || r)}</option>`).join('');
   const models = [...s.models].sort((a, b) => order.indexOf(a.role) - order.indexOf(b.role));
   $('modelList').innerHTML = models.length ? models.map(m => `
@@ -369,7 +377,7 @@ function renderModels(s) {
 document.querySelectorAll('#engineSeg button').forEach(b => b.onclick = async () => {
   await api('/api/select', {role: 'engine', file: b.dataset.e}); lastModelsKey = ''; poll();
 });
-['dit', 'te', 'vae', 'vision', 'mlx'].forEach(role => $('sel_' + role).onchange = async e => {
+['dit', 'te', 'vae', 'vision', 'lora', 'mlx'].forEach(role => $('sel_' + role).onchange = async e => {
   await api('/api/select', {role, file: e.target.value}); lastModelsKey = ''; poll();
 });
 
@@ -532,7 +540,7 @@ function show(h) {
   $('infoPrompt').textContent = h.prompt;
   $('infoPrompt').classList.remove('open');
   $('infoMeta').textContent = `${h.size.replace('x', '×')} · ${h.steps}步 · CFG ${h.cfg}` + (h.seconds ? ` · ${fmt(h.seconds)}` : '')
-    + (h.fast ? ' · 加速' : '') + (h.ref ? ' · 图生图' : '') + (h.engine === 'mlx' ? ' · MLX' : '') + (h.dit ? ` · ${h.dit.replace(/\.(gguf|safetensors)$/, '')}` : '');
+    + (h.fast ? ' · 加速' : '') + (h.ref ? ' · 图生图' : '') + (h.engine === 'mlx' ? ' · MLX' : '') + (h.lora ? ` · ${h.lora}` : '') + (h.dit ? ` · ${h.dit.replace(/\.(gguf|safetensors)$/, '')}` : '');
   $('infoMeta').title = `种子 ${h.seed}` + (h.te ? `\n文本编码器 ${h.te}` : '');
   $('history').querySelectorAll('img').forEach(img => {
     const on = history[img.dataset.i] === h;
