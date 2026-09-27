@@ -285,6 +285,11 @@ def part_of(t):
     return d.with_name(d.name + ".part")
 
 
+def mark_installed(t):
+    """程序压缩包解压后就删了，记下装的是哪个链接，预设据此判断装没装过。"""
+    update_settings(lambda st: st.setdefault("installed", {}).__setitem__(t["role"], t["url"]))
+
+
 def postprocess(t):
     """sd.cpp 程序压缩包：解压到 bin/ 并去掉隔离属性。"""
     d = dest_of(t)
@@ -297,6 +302,7 @@ def postprocess(t):
                 f.chmod(0o755)
         subprocess.run(["xattr", "-dr", "com.apple.quarantine", str(dest)], capture_output=True)
         to_trash(d)
+        mark_installed(t)
         return
     if t["role"] != "engine":
         return
@@ -312,6 +318,7 @@ def postprocess(t):
             f.chmod(0o755)
     subprocess.run(["xattr", "-dr", "com.apple.quarantine", str(BIN)], capture_output=True)
     to_trash(d)
+    mark_installed(t)
     schedule_preload()  # 模型常驻着的话换成新程序
 
 
@@ -418,9 +425,8 @@ def add_download(url, role, name, source):
             raise ValueError("文件路径不合法：" + dest)
     added = 0
     with dl_lock:
-        # 模型文件已被删掉的「已完成」任务不算数，否则预设没法重新下载
-        ts = [t for t in tasks() if not (t["status"] == "done" and t["dest"].startswith("models/")
-                                         and not dest_of(t).exists())]
+        # 文件已被删掉（或程序包解压后已清理）的「已完成」任务不算数，否则没法重新下载
+        ts = [t for t in tasks() if not (t["status"] == "done" and not dest_of(t).exists())]
         known = {t["dest"] for t in ts if t["status"] != "error"}
         for u, dest, size in entries:
             if dest in known:
@@ -481,6 +487,38 @@ def task_view():
         have = final.stat().st_size if t["status"] == "done" and final.exists() else (
             part.stat().st_size if part.exists() else 0)
         out.append({k: t.get(k) for k in ("id", "name", "role", "size", "status", "error", "url")} | {"have": have})
+    return out
+
+
+def preset_item_dest(it):
+    url = it["url"]
+    m = re.match(r"https://huggingface\.co/([^/]+)/([^/]+)/?$", url)
+    if m:  # 整个仓库
+        return f"models/{m[1]}/{m[2]}"
+    fname = unquote(Path(urlparse(url).path).name)
+    return f"bin/{fname}" if it["role"] in ("engine", "mlx_engine") else f"models/{fname}"
+
+
+def preset_view(sel, ts):
+    """每个预设的状态：done 全都有了 / busy 还在队列里 / partial 缺一部分 / none 都没有。"""
+    installed = load_json(SETTINGS, {}).get("installed", {})
+    pending = [t["dest"] for t in ts if t["status"] != "done"]
+    used = {v for k, v in sel.items() if k != "engine" and v}
+    out = []
+    for p in PRESETS:
+        have, busy, missing, in_use = 0, 0, [], False
+        for i, it in enumerate(p["items"]):
+            dest = preset_item_dest(it)
+            if any(d == dest or d.startswith(dest + "/") for d in pending):
+                busy += 1
+            elif (installed.get(it["role"]) == it["url"] if it["role"] in ("engine", "mlx_engine")
+                  else (ROOT / dest).exists()):
+                have += 1
+                in_use |= dest.startswith("models/") and dest[len("models/"):] in used
+            else:
+                missing.append(i)
+        state = "busy" if busy and not missing else "done" if not missing else "partial" if have or busy else "none"
+        out.append({"state": state, "missing": missing, "in_use": in_use})
     return out
 
 
@@ -1051,6 +1089,7 @@ def status():
         "sel": (sel := selection(inv)),
         "turbo": len(turbo_nodes(sel["lora"]) or []),
         "tasks": task_view(),
+        "presets": preset_view(sel, tasks()),
         "job": {k: job[k] for k in ("running", "stage", "step", "total", "spi", "error", "output")}
                | {"eta": eta, "elapsed": round(time.time() - job["started"]) if job["started"] else 0,
                   "log": job["log"][-80:]},
