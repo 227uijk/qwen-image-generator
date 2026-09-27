@@ -712,6 +712,7 @@ $('reuse').onclick = () => {
 $('asRef').onclick = async () => {
   if (!current) return;
   const b = await (await fetch('/outputs/' + current.name)).blob();
+  refs = [];  // 拿结果接着改是替换，不是追加，否则会连旧参考图一起排队
   readFiles([new File([b], current.name, {type: b.type})]);
 };
 $('reveal').onclick = () => current && api('/api/reveal', {name: current.name});
