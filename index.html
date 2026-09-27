@@ -167,7 +167,10 @@
   .presets { display: grid; gap: 6px; margin-top: 10px; }
   .preset { text-align: left; border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 8px;
             padding: 8px 10px; cursor: pointer; font: 12.5px var(--sans); }
-  .preset:hover { border-color: var(--accent); }
+  .preset:hover:not(:disabled) { border-color: var(--accent); }
+  .preset:disabled { cursor: default; opacity: .55; }
+  .preset .tag { float: right; font: 11px var(--mono); color: var(--faint); }
+  .preset .tag.use { color: var(--accent); }
   .preset small { display: block; color: var(--faint); font-size: 11px; margin-top: 1px; }
   .task { padding: 8px 0; border-top: 1px solid var(--line); font-size: 12px; }
   .task:first-child { border-top: 0; }
@@ -297,7 +300,7 @@
     </div>
     <button class="btn" id="dlAdd" style="width:100%;margin-top:8px">加入下载队列</button>
     <div class="err" id="dlErr"></div>
-    <div class="hint">推荐预设（点一下加入队列）：</div>
+    <div class="hint">推荐预设（点一下加入队列，已有的会自动跳过）：</div>
     <div class="presets" id="presets"></div>
   </div>
 
@@ -381,6 +384,28 @@ document.querySelectorAll('#engineSeg button').forEach(b => b.onclick = async ()
   await api('/api/select', {role, file: e.target.value}); lastModelsKey = ''; poll();
 });
 
+// ---------- 推荐预设 ----------
+let lastPresetsKey = '';
+function renderPresets(s) {
+  const key = JSON.stringify(s.presets);
+  if (key === lastPresetsKey || !meta.presets.length) return;
+  lastPresetsKey = key;
+  $('presets').innerHTML = meta.presets.map((p, i) => {
+    const st = s.presets[i] || {state: 'none', missing: []};
+    const prog = p.items.every(it => it.role === 'engine');
+    const tag = st.state === 'done' ? (st.in_use ? '<span class="tag use">● 正在使用</span>' : `<span class="tag">✓ ${prog ? '已是最新' : '已下载'}</span>`)
+      : st.state === 'busy' ? '<span class="tag">下载中…</span>'
+      : st.state === 'partial' ? `<span class="tag">还差 ${st.missing.length} 项，点击补齐</span>` : '';
+    const off = st.state === 'done' || st.state === 'busy';
+    return `<button class="preset" data-i="${i}" ${off ? 'disabled' : ''}>${tag}${esc(p.name)}<small>${esc(p.desc)}</small></button>`;
+  }).join('');
+  document.querySelectorAll('.preset').forEach(b => b.onclick = () => {
+    const i = b.dataset.i, st = s.presets[i];
+    // 只把缺的那几项加进队列
+    addItems(st && st.state === 'partial' ? st.missing.map(k => meta.presets[i].items[k]) : meta.presets[i].items);
+  });
+}
+
 // ---------- 下载队列 ----------
 function taskSpeed(t) {
   const now = Date.now(), arr = speeds[t.id] = speeds[t.id] || [];
@@ -436,8 +461,6 @@ $('dlClear').onclick = async () => { await api('/api/dl/action', {action: 'clear
 async function loadMeta() {
   meta = await api('/api/meta');
   $('dlRole').innerHTML = Object.entries(meta.roles).map(([k, v]) => `<option value="${k}">${esc(v)}</option>`).join('');
-  $('presets').innerHTML = meta.presets.map((p, i) => `<button class="preset" data-i="${i}">${esc(p.name)}<small>${esc(p.desc)}</small></button>`).join('');
-  document.querySelectorAll('.preset').forEach(b => b.onclick = () => addItems(meta.presets[b.dataset.i].items));
 }
 
 function renderChip(s) {
@@ -509,6 +532,7 @@ async function poll() {
     $('disk').innerHTML = `磁盘 <b>${s.disk} GB</b>`;
     renderModels(s);
     renderTasks(s);
+    renderPresets(s);
     renderJob(s, renderChip(s));
     renderEngine(s);
   } catch (e) {

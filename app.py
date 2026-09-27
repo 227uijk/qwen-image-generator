@@ -418,9 +418,8 @@ def add_download(url, role, name, source):
             raise ValueError("文件路径不合法：" + dest)
     added = 0
     with dl_lock:
-        # 模型文件已被删掉的「已完成」任务不算数，否则预设没法重新下载
-        ts = [t for t in tasks() if not (t["status"] == "done" and t["dest"].startswith("models/")
-                                         and not dest_of(t).exists())]
+        # 文件已被删掉（或程序包解压后已清理）的「已完成」任务不算数，否则没法重新下载
+        ts = [t for t in tasks() if not (t["status"] == "done" and not dest_of(t).exists())]
         known = {t["dest"] for t in ts if t["status"] != "error"}
         for u, dest, size in entries:
             if dest in known:
@@ -481,6 +480,60 @@ def task_view():
         have = final.stat().st_size if t["status"] == "done" and final.exists() else (
             part.stat().st_size if part.exists() else 0)
         out.append({k: t.get(k) for k in ("id", "name", "role", "size", "status", "error", "url")} | {"have": have})
+    return out
+
+
+_commit_cache = {}
+
+
+def sd_commit():
+    """正在用的 sd.cpp 的提交号：编译时写进了 libstable-diffusion.dylib（\\0 提交号 \\0 版本号 \\0）。"""
+    exe = sd_server()
+    lib = exe and exe.parent / "libstable-diffusion.dylib"
+    if not lib or not lib.exists():
+        return None
+    key = (str(lib), lib.stat().st_mtime)
+    if key not in _commit_cache:
+        m = re.search(rb"\0([0-9a-f]{7})\0\d+\.\d+\.\d+\0", lib.read_bytes())
+        _commit_cache.clear()
+        _commit_cache[key] = m and m[1].decode()
+    return _commit_cache[key]
+
+
+def program_installed(it):
+    if it["role"] == "mlx_engine":
+        return bool(mlx_serve())
+    m = re.search(r"-([0-9a-f]{7})-bin-", it["url"])
+    return bool(m) and m[1] == sd_commit()
+
+
+def preset_item_dest(it):
+    url = it["url"]
+    m = re.match(r"https://huggingface\.co/([^/]+)/([^/]+)/?$", url)
+    if m:  # 整个仓库
+        return f"models/{m[1]}/{m[2]}"
+    fname = unquote(Path(urlparse(url).path).name)
+    return f"bin/{fname}" if it["role"] in ("engine", "mlx_engine") else f"models/{fname}"
+
+
+def preset_view(sel, ts):
+    """每个预设的状态：done 全都有了 / busy 还在队列里 / partial 缺一部分 / none 都没有。"""
+    pending = [t["dest"] for t in ts if t["status"] != "done"]
+    used = {v for k, v in sel.items() if k != "engine" and v}
+    out = []
+    for p in PRESETS:
+        have, busy, missing, in_use = 0, 0, [], False
+        for i, it in enumerate(p["items"]):
+            dest = preset_item_dest(it)
+            if any(d == dest or d.startswith(dest + "/") for d in pending):
+                busy += 1
+            elif program_installed(it) if it["role"] in ("engine", "mlx_engine") else (ROOT / dest).exists():
+                have += 1
+                in_use |= dest.startswith("models/") and dest[len("models/"):] in used
+            else:
+                missing.append(i)
+        state = "busy" if busy and not missing else "done" if not missing else "partial" if have or busy else "none"
+        out.append({"state": state, "missing": missing, "in_use": in_use})
     return out
 
 
@@ -1051,6 +1104,7 @@ def status():
         "sel": (sel := selection(inv)),
         "turbo": len(turbo_nodes(sel["lora"]) or []),
         "tasks": task_view(),
+        "presets": preset_view(sel, tasks()),
         "job": {k: job[k] for k in ("running", "stage", "step", "total", "spi", "error", "output")}
                | {"eta": eta, "elapsed": round(time.time() - job["started"]) if job["started"] else 0,
                   "log": job["log"][-80:]},
