@@ -502,6 +502,14 @@ function renderChip(s) {
 }
 
 // ---------- 生成 ----------
+const clock = {start: null, end: null, eta: null};
+function tick() {
+  if (!clock.start) { $('eta').textContent = ''; return; }
+  const now = Date.now();
+  $('eta').textContent = fmt(Math.floor((now - clock.start) / 1000))
+    + (clock.end != null ? ` · 剩 ${fmt(Math.max(0, Math.ceil((clock.end - now) / 1000)))}` : '');
+}
+setInterval(tick, 250);
 function renderJob(s, ready) {
   const j = s.job;
   $('go').disabled = !j.running && !ready;
@@ -512,7 +520,14 @@ function renderJob(s, ready) {
   if (j.total) stage += ` · ${j.step}/${j.total}`;
   if (j.spi) stage += ` · ${j.spi.toFixed(1)}s/步`;
   $('stage').textContent = stage;
-  $('eta').textContent = j.running ? `${fmt(j.elapsed)}` + (j.eta != null ? ` · 剩 ${fmt(j.eta)}` : '') : '';
+  // 轮询 1.5 秒一次，直接显示后台给的秒数会跳秒；记下起点，由本地每秒走表
+  if (j.running) {
+    const start = Date.now() - j.elapsed * 1000;
+    if (!clock.start || Math.abs(clock.start - start) > 1500) clock.start = start;
+    // 剩余时间只在走完一步时才变，变了才重新对表，中间照常倒数
+    if (j.eta !== clock.eta) { clock.eta = j.eta; clock.end = j.eta != null ? Date.now() + j.eta * 1000 : null; }
+  } else clock.start = clock.end = clock.eta = null;
+  tick();
   $('prog').style.width = j.total ? (j.step / j.total * 100) + '%' : (j.running ? '3%' : '0');
   $('genErr').textContent = reqErr || j.error || '';
   $('badge').textContent = j.running ? `冲洗中 · ${stage}` : '';
