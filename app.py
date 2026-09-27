@@ -597,8 +597,14 @@ def sd_line(line):
         return
     low = line.lower()
     if live and job["step"] == 0:
-        if "load" in low:
-            job["stage"] = "加载模型"
+        if "load" in low and "completed" not in low:
+            te, lora = job.get("te_name"), job.get("lora_name")
+            if te and te in low:  # 省内存模式下文本编码器放在磁盘，每张图都要重新读一遍
+                job["stage"] = "读取文本编码器" + ("（省内存模式每次都要读）" if job.get("lowmem") else "")
+            elif lora and lora in low:
+                job["stage"] = "加载 LoRA"
+            else:
+                job["stage"] = "加载模型"
         elif "condition" in low or "encod" in low:
             job["stage"] = "编码提示词"
     log_line(line)
@@ -709,8 +715,11 @@ def ensure_sd(sel, lowmem, warm=False):
     if warm:  # 权重是第一次用到时才加载的，出一张极小的图把它们提前拉进内存
         eng["warming"] = True
         try:
-            run_sd_job({"prompt": "warm up", "width": 256, "height": 256, "seed": 1,
-                        "sample_params": {"sample_steps": 1}})
+            body = {"prompt": "warm up", "width": 256, "height": 256, "seed": 1,
+                    "sample_params": {"sample_steps": 1}}
+            if sel["lora"]:  # LoRA 也是第一次用时才合进去，预热时一起做掉
+                body["lora"] = [{"path": sel["lora"], "multiplier": 1.0}]
+            run_sd_job(body)
         finally:
             eng["warming"] = False
 
@@ -848,6 +857,8 @@ def fail(e):
 
 def sd_worker(sel, lowmem, body, record):
     eng["want"] = True
+    job.update(lowmem=lowmem, te_name=Path(sel["te"]).name.lower(),
+               lora_name=Path(sel["lora"]).name.lower() if sel["lora"] else None)
     try:
         lock_engine()
         try:

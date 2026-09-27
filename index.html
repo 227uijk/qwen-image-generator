@@ -551,7 +551,8 @@ function renderEngine(s) {
   $('engBtn').className = 'chip ' + cls;
   $('engBtn').dataset.state = s.warm;
   $('engBtn').disabled = s.job.running;
-  $('engBtn').title = s.job.running ? '生成中' : (s.warm === 'off' ? '提前把模型读进内存，出图时就不用等加载' : '把模型从内存里卸掉（模型文件不会删）');
+  $('engBtn').title = s.job.running ? '生成中' : (s.warm === 'off' ? '提前把模型读进内存，出图时就不用等加载' : '把模型从内存里卸掉（模型文件不会删）')
+    + (s.warm !== 'off' && $('lowmem').checked && s.sel.engine !== 'mlx' ? '\n省内存模式下文本编码器不常驻，每张图仍要从磁盘读一次；内存够的话关掉省内存模式就不用读了' : '');
 }
 $('engBtn').onclick = async () => {
   reqErr = '';
