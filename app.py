@@ -285,11 +285,6 @@ def part_of(t):
     return d.with_name(d.name + ".part")
 
 
-def mark_installed(t):
-    """程序压缩包解压后就删了，记下装的是哪个链接，预设据此判断装没装过。"""
-    update_settings(lambda st: st.setdefault("installed", {}).__setitem__(t["role"], t["url"]))
-
-
 def postprocess(t):
     """sd.cpp 程序压缩包：解压到 bin/ 并去掉隔离属性。"""
     d = dest_of(t)
@@ -302,7 +297,6 @@ def postprocess(t):
                 f.chmod(0o755)
         subprocess.run(["xattr", "-dr", "com.apple.quarantine", str(dest)], capture_output=True)
         to_trash(d)
-        mark_installed(t)
         return
     if t["role"] != "engine":
         return
@@ -318,7 +312,6 @@ def postprocess(t):
             f.chmod(0o755)
     subprocess.run(["xattr", "-dr", "com.apple.quarantine", str(BIN)], capture_output=True)
     to_trash(d)
-    mark_installed(t)
     schedule_preload()  # 模型常驻着的话换成新程序
 
 
@@ -490,6 +483,30 @@ def task_view():
     return out
 
 
+_commit_cache = {}
+
+
+def sd_commit():
+    """正在用的 sd.cpp 的提交号：编译时写进了 libstable-diffusion.dylib（\\0 提交号 \\0 版本号 \\0）。"""
+    exe = sd_server()
+    lib = exe and exe.parent / "libstable-diffusion.dylib"
+    if not lib or not lib.exists():
+        return None
+    key = (str(lib), lib.stat().st_mtime)
+    if key not in _commit_cache:
+        m = re.search(rb"\0([0-9a-f]{7})\0\d+\.\d+\.\d+\0", lib.read_bytes())
+        _commit_cache.clear()
+        _commit_cache[key] = m and m[1].decode()
+    return _commit_cache[key]
+
+
+def program_installed(it):
+    if it["role"] == "mlx_engine":
+        return bool(mlx_serve())
+    m = re.search(r"-([0-9a-f]{7})-bin-", it["url"])
+    return bool(m) and m[1] == sd_commit()
+
+
 def preset_item_dest(it):
     url = it["url"]
     m = re.match(r"https://huggingface\.co/([^/]+)/([^/]+)/?$", url)
@@ -501,7 +518,6 @@ def preset_item_dest(it):
 
 def preset_view(sel, ts):
     """每个预设的状态：done 全都有了 / busy 还在队列里 / partial 缺一部分 / none 都没有。"""
-    installed = load_json(SETTINGS, {}).get("installed", {})
     pending = [t["dest"] for t in ts if t["status"] != "done"]
     used = {v for k, v in sel.items() if k != "engine" and v}
     out = []
@@ -511,8 +527,7 @@ def preset_view(sel, ts):
             dest = preset_item_dest(it)
             if any(d == dest or d.startswith(dest + "/") for d in pending):
                 busy += 1
-            elif (installed.get(it["role"]) == it["url"] if it["role"] in ("engine", "mlx_engine")
-                  else (ROOT / dest).exists()):
+            elif program_installed(it) if it["role"] in ("engine", "mlx_engine") else (ROOT / dest).exists():
                 have += 1
                 in_use |= dest.startswith("models/") and dest[len("models/"):] in used
             else:

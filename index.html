@@ -392,7 +392,8 @@ function renderPresets(s) {
   lastPresetsKey = key;
   $('presets').innerHTML = meta.presets.map((p, i) => {
     const st = s.presets[i] || {state: 'none', missing: []};
-    const tag = st.state === 'done' ? (st.in_use ? '<span class="tag use">● 正在使用</span>' : '<span class="tag">✓ 已下载</span>')
+    const prog = p.items.every(it => it.role === 'engine');
+    const tag = st.state === 'done' ? (st.in_use ? '<span class="tag use">● 正在使用</span>' : `<span class="tag">✓ ${prog ? '已是最新' : '已下载'}</span>`)
       : st.state === 'busy' ? '<span class="tag">下载中…</span>'
       : st.state === 'partial' ? `<span class="tag">还差 ${st.missing.length} 项，点击补齐</span>` : '';
     const off = st.state === 'done' || st.state === 'busy';
