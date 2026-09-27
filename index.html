@@ -67,7 +67,15 @@
           cursor: pointer; font-size: 12px; position: relative; transition: all .15s; }
   .drop:hover, .drop.over { border-color: var(--accent); color: var(--ink); background: var(--accent-soft); }
   .drop img { max-width: 100%; max-height: 140px; border-radius: 5px; display: block; margin: 0 auto; }
-  .drop .x { position: absolute; top: 6px; right: 6px; background: rgba(0,0,0,.6); }
+  .drop .x { position: absolute; top: 4px; right: 4px; background: rgba(0,0,0,.6); padding: 1px 6px; font-size: 11px; }
+  .drop .thumbs { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-bottom: 8px; }
+  .drop .thumbs:empty { display: none; }
+  .drop .thumbs div { position: relative; }
+  .drop .thumbs img { width: 100%; height: 72px; object-fit: cover; max-height: none; }
+  .stops { display: flex; gap: 8px; margin-top: 8px; }
+  .stops[hidden] { display: none; }
+  .stops button { flex: 1; border: 0; border-radius: 7px; padding: 7px; cursor: pointer; font: 12.5px var(--sans);
+                  background: transparent; color: var(--bad); box-shadow: inset 0 0 0 1px var(--bad); }
   .toggle { display: flex; gap: 9px; align-items: flex-start; margin-top: 9px; cursor: pointer; font-size: 12.5px; }
   .toggle input { width: 14px; height: 14px; margin: 2px 0 0; accent-color: var(--accent); flex: none; }
   .toggle span small { display: block; color: var(--faint); font-size: 11px; }
@@ -78,7 +86,6 @@
         box-shadow: 0 0 0 1px rgba(233,162,59,.3), 0 8px 24px -10px rgba(233,162,59,.55); transition: transform .1s, filter .15s; }
   #go:hover:not(:disabled) { filter: brightness(1.07); } #go:active:not(:disabled) { transform: translateY(1px); }
   #go:disabled { opacity: .4; cursor: not-allowed; box-shadow: none; }
-  #go.cancel { background: transparent; color: var(--bad); box-shadow: inset 0 0 0 1px var(--bad); }
   .kbd { font: 10.5px var(--mono); opacity: .55; margin-left: 6px; }
   .status { display: flex; justify-content: space-between; margin-top: 11px; font: 11.5px var(--mono); color: var(--mute); }
   .bar { height: 3px; background: var(--line); border-radius: 2px; overflow: hidden; margin-top: 6px; }
@@ -204,9 +211,12 @@
         <div class="sec"><span>提示词</span><span>⌘↩ 生成</span></div>
         <textarea id="prompt" placeholder="描述你想要的画面，中英文都可以。&#10;例：一只橘猫坐在窗台上，傍晚的阳光，胶片质感"></textarea>
         <input id="negative" placeholder="反向提示词（可选，CFG > 1 时生效）" style="margin-top:8px">
+        <label class="toggle"><input type="checkbox" id="multi">
+          <span>每行一条提示词<small>一行排一组，依次出图</small></span></label>
 
-        <div class="sec"><span>参考图</span><span>放了就是图生图</span></div>
-        <div class="drop" id="drop">点击或拖入一张图片<input type="file" id="file" accept="image/*" hidden></div>
+        <div class="sec"><span>参考图</span><span>放了就是指令编辑，多张就逐张排队</span></div>
+        <div class="drop" id="drop"><div class="thumbs" id="thumbs"></div><span id="dropTip">点击或拖入图片（可多张）</span></div>
+        <input type="file" id="file" accept="image/*" multiple hidden>
 
         <div class="sec"><span>模型</span><button class="ghost" id="manageBtn" style="padding:0;font:inherit;letter-spacing:0">管理 ›</button></div>
         <div class="seg" id="engineSeg">
@@ -243,16 +253,18 @@
               <option value="6">6 · sd.cpp 示例</option>
             </select></div>
           <div class="field"><label>种子（-1 随机）</label><input id="seed" type="number" value="-1"></div>
+          <div class="field"><label>每组张数 <span class="lock" id="seedHint"></span></label><input id="count" type="number" min="1" max="50" value="1"></div>
         </div>
         <div class="hint lock" id="turboHint" hidden></div>
         <label class="toggle"><input type="checkbox" id="fast">
           <span>加速 EasyCache<small>跳过变化小的步，更快但画面会变糊，步数多（30+）时才建议开</small></span></label>
-        <label class="toggle"><input type="checkbox" id="lowmem" checked>
-          <span>省内存模式<small>文本编码器从磁盘读，16 GB 机器建议开</small></span></label>
+        <label class="toggle"><input type="checkbox" id="teDisk">
+          <span>文本编码器放磁盘<small>每张图多等约一分钟重读，只在生成时报内存不足才开</small></span></label>
       </div>
 
       <div class="dock">
         <button id="go">生成<span class="kbd">⌘↩</span></button>
+        <div class="stops" id="stops" hidden><button id="skip">跳过这张</button><button id="stopAll">全部停止</button></div>
         <div class="status"><span id="stage">空闲</span><span id="eta"></span></div>
         <div class="bar"><i id="prog"></i></div>
         <div class="err" id="genErr"></div>
@@ -319,7 +331,7 @@ const $ = id => document.getElementById(id);
 const gb = b => b >= 1e9 ? (b / 1e9).toFixed(2) + ' GB' : (b / 1e6).toFixed(0) + ' MB';
 const fmt = s => s >= 3600 ? `${Math.floor(s / 3600)} 时 ${Math.floor(s % 3600 / 60)} 分` : s >= 60 ? `${Math.floor(s / 60)} 分 ${s % 60} 秒` : `${s} 秒`;
 const esc = t => String(t).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
-let refData = null, current = null, lastOutput, jobSeen = false, history = [], firstPoll = true, meta = {roles: {}, presets: []};
+let refs = [], current = null, lastOutput, jobSeen = false, history = [], firstPoll = true, meta = {roles: {}, presets: []};
 let reqErr = '';  // 提交被后台拒绝的原因，不能被轮询覆盖掉
 const speeds = {};  // 每个下载任务最近 30 秒的字节采样
 
@@ -358,7 +370,7 @@ function renderModels(s) {
   document.querySelectorAll('#engineSeg button').forEach(b => b.classList.toggle('on', b.dataset.e === s.sel.engine));
   $('sdSel').hidden = mlx; $('mlxSel').hidden = !mlx;
   $('engineHint').textContent = mlx
-    ? (s.mlx_engine ? 'MLX 引擎：苹果 MLX 框架，不支持参考图；省内存 / 加速开关对它无效。' : 'MLX-Serve 程序还没装，去「管理」下载「MLX 引擎套装」。')
+    ? (s.mlx_engine ? 'MLX 引擎：苹果 MLX 框架，不支持参考图；磁盘模式 / 加速开关对它无效。' : 'MLX-Serve 程序还没装，去「管理」下载「MLX 引擎套装」。')
     : !s.engine ? 'sd.cpp 程序还没装，去「管理」下载「基础套装」。'
     : '';
   const order = ['dit', 'te', 'vae', 'vision', 'lora', 'mlx', 'other'];
@@ -502,7 +514,7 @@ function renderChip(s) {
 }
 
 // ---------- 生成 ----------
-const clock = {start: null, end: null, eta: null};
+const clock = {start: null, end: null};
 function tick() {
   if (!clock.start) { $('eta').textContent = ''; return; }
   const now = Date.now();
@@ -512,21 +524,25 @@ function tick() {
 setInterval(tick, 250);
 function renderJob(s, ready) {
   const j = s.job;
-  $('go').disabled = !j.running && !ready;
-  const goHtml = j.running ? '取消' : (ready ? '生成<span class="kbd">⌘↩</span>' : '先下载模型');
+  const n = planned(), busy = j.running || s.queue.pending > 0;
+  const goHtml = !ready ? '先下载模型'
+    : (busy ? '加入队列' : '生成') + (n > 1 ? ` ${n} 张` : '') + '<span class="kbd">⌘↩</span>';
   if ($('go').innerHTML !== goHtml) $('go').innerHTML = goHtml;  // 每次都重写会吞掉正按下的点击
-  $('go').classList.toggle('cancel', j.running);
-  let stage = j.stage;
+  $('go').disabled = !ready;
+  $('stops').hidden = !busy;
+  $('skip').hidden = !j.running;
+  $('stopAll').textContent = s.queue.pending ? `全部停止 · 还排 ${s.queue.pending} 张` : '停止';
+  $('stops').title = s.queue.next.length ? '接下来：\n' + s.queue.next.join('\n') : '';
+  let stage = (s.queue.total > 1 && j.running ? `第 ${Math.min(s.queue.done + 1, s.queue.total)}/${s.queue.total} 张 · ` : '') + j.stage;
   if (j.total) stage += ` · ${j.step}/${j.total}`;
   if (j.spi) stage += ` · ${j.spi.toFixed(1)}s/步`;
   $('stage').textContent = stage;
-  // 轮询 1.5 秒一次，直接显示后台给的秒数会跳秒；记下起点，由本地每秒走表
+  // 后台给的是开始、预计结束的时刻（同一台机器，时钟一致），本地照着走表；
+  // 不用「已过秒数」，否则轮询响应慢时每次对表都会把秒表往回拽
   if (j.running) {
-    const start = Date.now() - j.elapsed * 1000;
-    if (!clock.start || Math.abs(clock.start - start) > 1500) clock.start = start;
-    // 剩余时间只在走完一步时才变，变了才重新对表，中间照常倒数
-    if (j.eta !== clock.eta) { clock.eta = j.eta; clock.end = j.eta != null ? Date.now() + j.eta * 1000 : null; }
-  } else clock.start = clock.end = clock.eta = null;
+    clock.start = j.started * 1000;
+    clock.end = j.end != null ? j.end * 1000 : null;
+  } else clock.start = clock.end = null;
   tick();
   $('prog').style.width = j.total ? (j.step / j.total * 100) + '%' : (j.running ? '3%' : '0');
   $('genErr').textContent = reqErr || j.error || '';
@@ -551,20 +567,26 @@ function renderEngine(s) {
   $('engBtn').className = 'chip ' + cls;
   $('engBtn').dataset.state = s.warm;
   $('engBtn').disabled = s.job.running;
-  $('engBtn').title = s.job.running ? '生成中' : (s.warm === 'off' ? '提前把模型读进内存，出图时就不用等加载' : '把模型从内存里卸掉（模型文件不会删）');
+  $('engBtn').title = s.job.running ? '生成中' : (s.warm === 'off' ? '提前把模型读进内存，出图时就不用等加载' : '把模型从内存里卸掉（模型文件不会删）')
+    + (s.warm !== 'off' && $('teDisk').checked && s.sel.engine !== 'mlx' ? '\n文本编码器放磁盘时不常驻，每张图仍要重读一次' : '');
 }
 $('engBtn').onclick = async () => {
   reqErr = '';
   try {
-    if ($('engBtn').dataset.state === 'off') await api('/api/engine/load', {lowmem: $('lowmem').checked});
+    if ($('engBtn').dataset.state === 'off') await api('/api/engine/load', {te_disk: $('teDisk').checked});
     else await api('/api/engine/unload', {});
   } catch (e) { reqErr = e.message; }
   poll();
 };
 
+let polling = false, pollAgain = false;
 async function poll() {
+  // 上一次还没回来就不叠着发（免得旧结果晚到覆盖新结果），等它回来再补一次
+  if (polling) { pollAgain = true; return; }
+  polling = true;
   try {
     const s = await api('/api/status');
+    if (firstPoll) $('teDisk').checked = !!s.te_disk;
     $('mem').innerHTML = s.mem == null ? '' : `内存 <b class="${s.mem < 6 ? 'warn' : ''}">${s.mem} GB</b>`;
     $('mem').title = s.mem < 6 ? '可用内存偏少，建议关掉些软件' : '当前可用内存';
     $('disk').innerHTML = `磁盘 <b>${s.disk} GB</b>`;
@@ -575,6 +597,9 @@ async function poll() {
     renderEngine(s);
   } catch (e) {
     $('stage').textContent = '后台服务已停止，重新打开「Qwen 生图」即可';
+  } finally {
+    polling = false;
+    if (pollAgain) { pollAgain = false; poll(); }
   }
 }
 
@@ -623,41 +648,60 @@ async function deleteCurrent() {
 $('delImg').onclick = deleteCurrent;
 
 // ---------- 参考图 ----------
-function setRef(dataUrl) {
-  refData = dataUrl;
-  $('drop').innerHTML = dataUrl
-    ? `<img src="${dataUrl}"><button class="ghost x" id="rmRef">移除</button>`
-    : '点击或拖入一张图片<input type="file" id="file" accept="image/*" hidden>';
-  if (dataUrl) $('rmRef').onclick = e => { e.stopPropagation(); setRef(null); };
-  else $('file').onchange = e => readFile(e.target.files[0]);
+// 可以放多张：同一组提示词对每张各做一遍指令编辑
+function renderRefs() {
+  $('thumbs').innerHTML = refs.map((r, i) => `<div><img src="${r}"><button class="ghost x" data-i="${i}">✕</button></div>`).join('');
+  $('dropTip').textContent = refs.length ? `${refs.length} 张 · 点击或拖入继续添加` : '点击或拖入图片（可多张）';
+  $('thumbs').querySelectorAll('.x').forEach(b => b.onclick = e => {
+    e.stopPropagation(); refs.splice(+b.dataset.i, 1); renderRefs(); updatePlan();
+  });
+  updatePlan();
 }
-function readFile(f) {
-  if (!f) return;
-  reqErr = !f.type.startsWith('image/') || f.type === 'image/svg+xml' ? '参考图需要是 PNG / JPG 等图片文件' : '';
+function readFiles(files) {
+  const imgs = [...files].filter(f => f.type.startsWith('image/') && f.type !== 'image/svg+xml');
+  reqErr = files.length && !imgs.length ? '参考图需要是 PNG / JPG 等图片文件' : '';
   $('genErr').textContent = reqErr;
-  if (reqErr) return;
-  const r = new FileReader();
-  r.onload = () => setRef(r.result);
-  r.readAsDataURL(f);
+  imgs.forEach(f => {
+    const r = new FileReader();
+    r.onload = () => { refs.push(r.result); renderRefs(); };
+    r.readAsDataURL(f);
+  });
 }
-$('drop').onclick = () => { if (!refData) $('file').click(); };
-$('file').onchange = e => readFile(e.target.files[0]);
+$('drop').onclick = () => $('file').click();
+$('file').onchange = e => { readFiles(e.target.files); e.target.value = ''; };
 $('drop').ondragover = e => { e.preventDefault(); $('drop').classList.add('over'); };
 $('drop').ondragleave = () => $('drop').classList.remove('over');
-$('drop').ondrop = e => { e.preventDefault(); $('drop').classList.remove('over'); readFile(e.dataTransfer.files[0]); };
+$('drop').ondrop = e => { e.preventDefault(); $('drop').classList.remove('over'); readFiles(e.dataTransfer.files); };
+
+// 这次点生成会排进几张：参考图数 × 提示词条数 × 每组张数
+function prompts() {
+  const t = $('prompt').value.trim();
+  return !t ? [] : $('multi').checked ? t.split('\n').map(l => l.trim()).filter(Boolean) : [t];
+}
+function planned() {
+  return Math.max(1, refs.length) * Math.max(1, prompts().length) * Math.max(1, Math.min(50, +$('count').value || 1));
+}
+function updatePlan() {
+  $('seedHint').textContent = +$('count').value > 1 && $('seed').value.trim() !== '' && +$('seed').value >= 0 ? '· 种子依次 +1' : '';
+  const n = planned(), html = $('go').innerHTML.replace(/ \d+ 张/, '').replace(/(生成|加入队列)/, `$1${n > 1 ? ` ${n} 张` : ''}`);
+  if (!$('go').disabled && $('go').innerHTML !== html) $('go').innerHTML = html;
+}
+['prompt', 'count', 'seed'].forEach(id => $(id).addEventListener('input', updatePlan));
+$('multi').onchange = updatePlan;
 
 $('go').onclick = async () => {
-  if ($('go').classList.contains('cancel')) { await api('/api/cancel', {}); return poll(); }
   reqErr = '';
   try {
     await api('/api/generate', {
-      prompt: $('prompt').value, negative: $('negative').value, ref: refData,
-      size: $('size').value, steps: +$('steps').value, cfg: +$('cfg').value,
-      seed: $('seed').value.trim() === '' ? -1 : +$('seed').value, lowmem: $('lowmem').checked, fast: $('fast').checked,
+      prompt: $('prompt').value, multi: $('multi').checked, negative: $('negative').value, refs,
+      size: $('size').value, steps: +$('steps').value, cfg: +$('cfg').value, count: +$('count').value || 1,
+      seed: $('seed').value.trim() === '' ? -1 : +$('seed').value, te_disk: $('teDisk').checked, fast: $('fast').checked,
     });
   } catch (e) { reqErr = e.message; }
   poll();
 };
+$('skip').onclick = async () => { await api('/api/cancel', {all: false}); poll(); };
+$('stopAll').onclick = async () => { await api('/api/cancel', {all: true}); poll(); };
 
 $('reuse').onclick = () => {
   if (!current) return;
@@ -668,7 +712,8 @@ $('reuse').onclick = () => {
 $('asRef').onclick = async () => {
   if (!current) return;
   const b = await (await fetch('/outputs/' + current.name)).blob();
-  readFile(new File([b], current.name, {type: b.type}));
+  refs = [];  // 拿结果接着改是替换，不是追加，否则会连旧参考图一起排队
+  readFiles([new File([b], current.name, {type: b.type})]);
 };
 $('reveal').onclick = () => current && api('/api/reveal', {name: current.name});
 $('quit').onclick = async () => {
@@ -679,7 +724,7 @@ $('quit').onclick = async () => {
 };
 document.addEventListener('keydown', e => {
   const typing = /INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName);
-  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !$('go').disabled && !$('go').classList.contains('cancel')) $('go').click();
+  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !$('go').disabled) $('go').click();
   else if ((e.key === 'Delete' || e.key === 'Backspace') && !typing && !document.body.classList.contains('drawer-open')) deleteCurrent();
   else if ((e.key === 'ArrowLeft' || e.key === 'ArrowRight') && !typing && current) {
     const i = history.indexOf(current) + (e.key === 'ArrowRight' ? 1 : -1);

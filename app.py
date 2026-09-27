@@ -539,7 +539,7 @@ def preset_view(sel, ts):
 
 # ---------- 常驻引擎 ----------
 # 引擎以服务方式常驻，模型加载一次后留在内存里，之后每张图都省掉加载时间。
-# 同一时间只留一个引擎（sd-server 或 mlx-serve）；换模型、换引擎、切省内存模式时重启。
+# 同一时间只留一个引擎（sd-server 或 mlx-serve）；换模型、换引擎、切文本编码器放磁盘时重启。
 
 PROG = re.compile(r"\|\s*(\d+)/(\d+)\s*-\s*([\d.]+)(s/it|it/s)")
 ENGINE_PID = TMP / "engine.pid"
@@ -592,13 +592,21 @@ def sd_line(line):
             spi = v if unit == "s/it" else (1 / v if v else None)
         else:
             spi = (now - job["t_first"]) / max(1, n - job["n_first"]) if n > job["n_first"] else job["spi"]
+        if n != job["step"] or "t_step" not in job:  # 同一步的进度行会重复打印，只在换步时对表
+            job["t_step"] = now
         job.update(step=n, total=t, spi=spi)
         job["stage"] = "采样中" if n < t else "解码中（VAE）"
         return
     low = line.lower()
     if live and job["step"] == 0:
-        if "load" in low:
-            job["stage"] = "加载模型"
+        if "load" in low and "completed" not in low:
+            te, lora = job.get("te_name"), job.get("lora_name")
+            if te and te in low:  # 文本编码器放磁盘时，每张图都要重新读一遍
+                job["stage"] = "读取文本编码器" + ("（磁盘模式每张图都要读）" if job.get("te_disk") else "")
+            elif lora and lora in low:
+                job["stage"] = "加载 LoRA"
+            else:
+                job["stage"] = "加载模型"
         elif "condition" in low or "encod" in low:
             job["stage"] = "编码提示词"
     log_line(line)
@@ -678,14 +686,14 @@ def start_engine(key, argv, health, pump):
     raise RuntimeError("引擎没能启动，看运行日志")
 
 
-def sd_key(sel, lowmem):
+def sd_key(sel, te_disk):
     # 带上程序路径：更新 sd.cpp 后下次生成自动换成新版
     exe = sd_server()
-    return ("sd", str(exe), exe and exe.stat().st_mtime, sel["dit"], sel["te"], sel["vae"], sel["vision"], bool(lowmem))
+    return ("sd", str(exe), exe and exe.stat().st_mtime, sel["dit"], sel["te"], sel["vae"], sel["vision"], bool(te_disk))
 
 
-def ensure_sd(sel, lowmem, warm=False):
-    key = sd_key(sel, lowmem)
+def ensure_sd(sel, te_disk, warm=False):
+    key = sd_key(sel, te_disk)
     if eng_alive() and eng["key"] == key:
         return
 
@@ -702,15 +710,22 @@ def ensure_sd(sel, lowmem, warm=False):
              "--backend", "vae=cpu"]
         if sel["vision"]:  # 权重按需加载，不放参考图时不占内存
             a += ["--llm_vision", str(MODELS / sel["vision"])]
-        if lowmem:
+        if te_disk:  # 文本编码器不映射，每张图用 read() 读进来、用完释放（慢，只给真爆内存时兜底）
             a += ["--params-backend", "te=disk"]
+        else:
+            # auto-fit 按启动时的空闲内存分配权重，不知道 mmap 的页能被系统回收，16 GB 上会把文本编码器也踢到
+            # 磁盘、每张图重读一遍；关掉它，全部权重都零拷贝映射，内存紧张时由系统按需丢页、再从磁盘读回
+            a += ["--auto-fit", "off"]
         return a
     start_engine(key, argv, "/sdcpp/v1/capabilities", pump_sd)
     if warm:  # 权重是第一次用到时才加载的，出一张极小的图把它们提前拉进内存
         eng["warming"] = True
         try:
-            run_sd_job({"prompt": "warm up", "width": 256, "height": 256, "seed": 1,
-                        "sample_params": {"sample_steps": 1}})
+            body = {"prompt": "warm up", "width": 256, "height": 256, "seed": 1,
+                    "sample_params": {"sample_steps": 1}}
+            if sel["lora"]:  # LoRA 也是第一次用时才合进去，预热时一起做掉
+                body["lora"] = [{"path": sel["lora"], "multiplier": 1.0}]
+            run_sd_job(body)
         finally:
             eng["warming"] = False
 
@@ -775,7 +790,7 @@ def preload():
                 else:
                     stop_engine()
             elif sd_server() and sel["dit"] and sel["te"] and sel["vae"]:
-                ensure_sd(sel, load_json(SETTINGS, {}).get("lowmem", True), warm=True)
+                ensure_sd(sel, load_json(SETTINGS, {}).get("te_disk", False), warm=True)
             else:
                 stop_engine()
         except Exception as e:
@@ -793,15 +808,15 @@ def schedule_preload(delay=1.5):
     eng["timer"].start()
 
 
-def load_engine(lowmem):
-    if load_json(SETTINGS, {}).get("lowmem", True) != lowmem:
-        update_settings(lambda st: st.__setitem__("lowmem", lowmem))
+def load_engine(te_disk):
+    if load_json(SETTINGS, {}).get("te_disk", False) != te_disk:
+        update_settings(lambda st: st.__setitem__("te_disk", te_disk))
     eng["want"] = True
     schedule_preload(0)
 
 
 def unload_engine():
-    if job["running"]:
+    if job["running"] or queue:
         raise ValueError("正在生成，先取消再卸载")
     eng["want"] = False
     t = eng.get("timer")
@@ -840,20 +855,23 @@ def finish(record, b64=None):
 def fail(e):
     if job["cancelled"]:
         job["stage"] = "已取消"
-        schedule_preload()  # 引擎被关掉了，用户没点过释放就重新加载回来
+        if not queue:  # 引擎被关掉了，用户没点过释放就重新加载回来；还有排队的话下一张自己会启动
+            schedule_preload()
     else:
         job["stage"] = "失败"
         job["error"] = str(e)
 
 
-def sd_worker(sel, lowmem, body, record):
+def sd_worker(sel, te_disk, body, record):
     eng["want"] = True
+    job.update(te_disk=te_disk, te_name=Path(sel["te"]).name.lower(),
+               lora_name=Path(sel["lora"]).name.lower() if sel["lora"] else None)
     try:
         lock_engine()
         try:
-            if not (eng_alive() and eng["key"] == sd_key(sel, lowmem)):
+            if not (eng_alive() and eng["key"] == sd_key(sel, te_disk)):
                 job["stage"] = "启动引擎"
-            ensure_sd(sel, lowmem)
+            ensure_sd(sel, te_disk)
             job["proc"] = eng["proc"]
             if job["cancelled"]:
                 raise RuntimeError("cancelled")
@@ -913,6 +931,8 @@ def mlx_worker(record, pack):
                         job["t_first"], job["n_first"] = now, int(step)
                     n = int(step)
                     spi = (now - job["t_first"]) / (n - job["n_first"]) if n > job["n_first"] else job["spi"]
+                    if n != job["step"] or "t_step" not in job:
+                        job["t_step"] = now
                     job.update(step=n, total=int(total), spi=spi,
                                stage="采样中" if n < int(total) else "解码中（VAE）")
                 if ev.get("error"):
@@ -949,21 +969,17 @@ def turbo_sigmas(nodes, w, h):
 
 
 def parse_params(req):
-    """校验并解析生成参数；出错抛 ValueError，此时任务还没占用。"""
-    prompt = (req.get("prompt") or "").strip()
-    if not prompt:
-        raise ValueError("提示词不能为空")
+    """校验并解析生成参数（提示词另外处理）；出错抛 ValueError。种子 -1 表示每张随机。"""
     try:
         w, h = (int(x) for x in str(req.get("size") or "512x512").split("x"))
         steps = max(1, min(80, int(req.get("steps") or 20)))
         cfg = float(req.get("cfg") or 1.0)
         seed = int(req.get("seed") if req.get("seed") is not None else -1)
+        count = max(1, min(50, int(req.get("count") or 1)))
     except (TypeError, ValueError):
-        raise ValueError("参数格式不对，检查一下尺寸 / 步数 / CFG / 种子")
-    if seed < 0:
-        seed = int.from_bytes(os.urandom(4), "big") & 0x7FFFFFFF
-    return {"prompt": prompt, "negative": (req.get("negative") or "").strip(), "size": f"{w}x{h}",
-            "w": w, "h": h, "steps": steps, "cfg": cfg, "seed": seed}
+        raise ValueError("参数格式不对，检查一下尺寸 / 步数 / CFG / 种子 / 张数")
+    return {"negative": (req.get("negative") or "").strip(), "size": f"{w}x{h}",
+            "w": w, "h": h, "steps": steps, "cfg": cfg, "seed": seed, "count": count}
 
 
 def decode_ref(ref):
@@ -978,43 +994,73 @@ def decode_ref(ref):
     return {"jpeg": "jpg"}.get(m[1], m[1]), data
 
 
-def claim_job():
-    with lock:
-        if job["running"]:
-            return False
-        job.update(running=True, stage="启动中", step=0, total=0, spi=None, log=[], error=None,
-                   output=None, started=time.time(), cancelled=False)
-        job.pop("t_first", None)
-        return True
+# ---------- 排队 ----------
+# 一次提交可以展开成多张：每张参考图 × 每条提示词 × 张数。引擎常驻，排队的图一张接一张出，
+# 同一条提示词的编码结果 sd.cpp 会缓存，后面几张不用再过文本编码器。
+
+queue = []  # 还没开始的图
+qstat = {"done": 0, "total": 0, "runner": None}
+MAX_QUEUE = 200
 
 
-def start_generate(req):
-    exe = sd_server()
+def out_path():
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    out, n = OUT / f"qwen_{stamp}.png", 2
+    while out.exists():  # 同一秒出了两张
+        out, n = OUT / f"qwen_{stamp}_{n}.png", n + 1
+    return stamp, out
+
+
+def build_items(req):
+    """把一次提交展开成排队项；参数有问题时返回错误文字。"""
     sel = selection()
-    ref = req.get("ref")
-    if sel["engine"] == "mlx":
-        return start_generate_mlx(req, sel)
-    need = ["dit", "te", "vae"] + (["vision"] if ref else [])
-    missing = ([] if exe else ["sd.cpp 程序"]) + [ROLES[r] for r in need if not sel[r]]
-    if missing:
-        return "还缺：" + "、".join(missing) + "（点右上角「模型」下载）"
+    mlx = sel["engine"] == "mlx"
+    refs = req.get("refs") or ([req["ref"]] if req.get("ref") else [])
+    if mlx:
+        missing = ([] if mlx_serve() else ["MLX-Serve 程序"]) + ([] if sel["mlx"] else ["MLX 模型包"])
+        if missing:
+            return "还缺：" + "、".join(missing) + "（点右上角「模型」下载「MLX 引擎套装」）"
+        if refs:
+            return "MLX 引擎的 Qwen 2.1 暂不支持参考图编辑，请切回 sd.cpp 引擎"
+    else:
+        need = ["dit", "te", "vae"] + (["vision"] if refs else [])
+        missing = ([] if sd_server() else ["sd.cpp 程序"]) + [ROLES[r] for r in need if not sel[r]]
+        if missing:
+            return "还缺：" + "、".join(missing) + "（点右上角「模型」下载）"
+    raw = (req.get("prompt") or "").strip()
+    prompts = [l.strip() for l in raw.splitlines() if l.strip()] if req.get("multi") else [raw]
+    if not raw:
+        return "提示词不能为空"
     try:
         prm = parse_params(req)
-        ref_img = decode_ref(ref) if ref else None
+        imgs = [decode_ref(r) for r in refs]
     except ValueError as e:
         return str(e)
-    if not claim_job():
-        return "已有任务在跑"
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    out = OUT / f"qwen_{stamp}.png"
-    lowmem = bool(req.get("lowmem", True))
-    if load_json(SETTINGS, {}).get("lowmem", True) != lowmem:  # 记住，下次打开按这个预载
-        update_settings(lambda st: st.__setitem__("lowmem", lowmem))
-    fast = bool(req.get("fast", False))
+    total = max(1, len(imgs)) * len(prompts) * prm["count"]
+    if len(queue) + total > MAX_QUEUE:
+        return f"一次排太多了（{total} 张），队列最多 {MAX_QUEUE} 张"
+    te_disk = bool(req.get("te_disk", False))
+    if not mlx and load_json(SETTINGS, {}).get("te_disk", False) != te_disk:  # 记住，下次打开按这个预载
+        update_settings(lambda st: st.__setitem__("te_disk", te_disk))
+    items = []
+    for img in imgs or [None]:
+        for p in prompts:
+            for i in range(prm["count"]):
+                # 固定种子时连出的几张依次 +1，方便事后复现某一张
+                seed = prm["seed"] + i if prm["seed"] >= 0 else int.from_bytes(os.urandom(4), "big") & 0x7FFFFFFF
+                items.append({**prm, "prompt": p, "seed": seed, "ref": img, "sel": sel, "te_disk": te_disk,
+                              "fast": bool(req.get("fast", False))})
+    return items
+
+
+def run_sd(it):
+    sel, prm = it["sel"], dict(it)
+    fast = prm["fast"]
     nodes = turbo_nodes(sel["lora"])
     if nodes:  # 蒸馏过的 LoRA：步数、CFG 由它决定，反向提示词和 EasyCache 都用不上
         prm.update(steps=len(nodes), cfg=1.0, negative="")
         fast = False
+    stamp, out = out_path()
     body = {"prompt": prm["prompt"], "negative_prompt": prm["negative"], "width": prm["w"], "height": prm["h"],
             "seed": prm["seed"], "output_format": "png",
             "sample_params": {"sample_method": "euler", "sample_steps": prm["steps"],
@@ -1025,38 +1071,67 @@ def start_generate(req):
         body["lora"] = [{"path": sel["lora"], "multiplier": 1.0}]
     if nodes:
         body["sample_params"]["custom_sigmas"] = turbo_sigmas(nodes, prm["w"], prm["h"])
-    if ref_img:
-        body["ref_images"] = [base64.b64encode(ref_img[1]).decode()]
+    if prm["ref"]:
+        body["ref_images"] = [base64.b64encode(prm["ref"][1]).decode()]
     record = {"file": str(out), "name": out.name, "prompt": prm["prompt"], "negative": prm["negative"],
-              "size": prm["size"], "steps": prm["steps"], "cfg": prm["cfg"], "seed": prm["seed"], "ref": bool(ref_img),
-              "fast": fast, "time": stamp, "dit": Path(sel["dit"]).name, "te": Path(sel["te"]).name,
-              "lora": Path(sel["lora"]).stem if sel["lora"] else None}
-    threading.Thread(target=sd_worker, args=(sel, lowmem, body, record), daemon=True).start()
+              "size": prm["size"], "steps": prm["steps"], "cfg": prm["cfg"], "seed": prm["seed"],
+              "ref": bool(prm["ref"]), "fast": fast, "time": stamp, "dit": Path(sel["dit"]).name,
+              "te": Path(sel["te"]).name, "lora": Path(sel["lora"]).stem if sel["lora"] else None}
+    sd_worker(sel, it["te_disk"], body, record)
+
+
+def run_mlx(it):
+    stamp, out = out_path()
+    record = {"file": str(out), "name": out.name, "prompt": it["prompt"], "negative": it["negative"],
+              "size": it["size"], "steps": it["steps"], "cfg": it["cfg"], "seed": it["seed"], "ref": None,
+              "fast": False, "time": stamp, "engine": "mlx", "dit": Path(it["sel"]["mlx"]).name}
+    mlx_worker(record, it["sel"]["mlx"])
+
+
+def runner():
+    while True:
+        with lock:
+            if not queue or dl_state.get("quitting"):
+                qstat["runner"] = None
+                return
+            it = queue.pop(0)
+            job.update(running=True, stage="启动中", step=0, total=0, spi=None, log=[], error=None,
+                       output=None, started=time.time(), cancelled=False)
+            job.pop("t_first", None)
+            job.pop("t_step", None)
+        try:
+            (run_mlx if it["sel"]["engine"] == "mlx" else run_sd)(it)
+        except Exception as e:  # 工作函数自己会兜住错误，这里只防意外
+            job.update(running=False, stage="失败", error=str(e))
+        with lock:
+            qstat["done"] += 1
+            if job["error"] and queue:  # 出错多半是内存或模型问题，后面的也会失败，先停下
+                job["error"] += f"\n（后面排队的 {len(queue)} 张已取消）"
+                qstat["total"] -= len(queue)
+                queue.clear()
+
+
+def start_generate(req):
+    items = build_items(req)
+    if isinstance(items, str):
+        return items
+    with lock:
+        if not queue and not job["running"] and not qstat["runner"]:
+            qstat.update(done=0, total=0)
+        queue.extend(items)
+        qstat["total"] += len(items)
+        if not qstat["runner"]:
+            qstat["runner"] = threading.Thread(target=runner, daemon=True)
+            qstat["runner"].start()
     return None
 
 
-def start_generate_mlx(req, sel):
-    missing = ([] if mlx_serve() else ["MLX-Serve 程序"]) + ([] if sel["mlx"] else ["MLX 模型包"])
-    if missing:
-        return "还缺：" + "、".join(missing) + "（点右上角「模型」下载「MLX 引擎套装」）"
-    if req.get("ref"):
-        return "MLX 引擎的 Qwen 2.1 暂不支持参考图编辑，请切回 sd.cpp 引擎"
-    try:
-        prm = parse_params(req)
-    except ValueError as e:
-        return str(e)
-    if not claim_job():
-        return "已有任务在跑"
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    out = OUT / f"qwen_{stamp}.png"
-    record = {"file": str(out), "name": out.name, "prompt": prm["prompt"], "negative": prm["negative"],
-              "size": prm["size"], "steps": prm["steps"], "cfg": prm["cfg"], "seed": prm["seed"], "ref": None,
-              "fast": False, "time": stamp, "engine": "mlx", "dit": Path(sel["mlx"]).name}
-    threading.Thread(target=mlx_worker, args=(record, sel["mlx"]), daemon=True).start()
-    return None
-
-
-def cancel_generate():
+def cancel_generate(clear=True):
+    """clear=True 连同排队的一起取消；False 只跳过正在出的这张。"""
+    if clear:
+        with lock:
+            qstat["total"] -= len(queue)
+            queue.clear()
     if not job["running"]:
         return
     job["cancelled"] = True  # 进程还没起来时，由工作线程启动后自己检查
@@ -1094,9 +1169,9 @@ def delete_model(rel):
 
 def status():
     inv = inventory()
-    eta = None
-    if job["running"] and job["spi"] and job["total"]:
-        eta = round((job["total"] - job["step"]) * job["spi"])
+    end = None  # 预计完成的时刻（时间戳）：从最近一步完成时起算，前端照着倒数，不受轮询快慢影响
+    if job["running"] and job["spi"] and job["step"] < job["total"] and job.get("t_step"):
+        end = job["t_step"] + (job["total"] - job["step"]) * job["spi"]
     return {
         "engine": bool(sd_server()),
         "mlx_engine": bool(mlx_serve()),
@@ -1106,11 +1181,15 @@ def status():
         "tasks": task_view(),
         "presets": preset_view(sel, tasks()),
         "job": {k: job[k] for k in ("running", "stage", "step", "total", "spi", "error", "output")}
-               | {"eta": eta, "elapsed": round(time.time() - job["started"]) if job["started"] else 0,
+               | {"end": end, "started": job["started"],
                   "log": job["log"][-80:]},
         "mem": avail_mem_gb(),
         "disk": round(shutil.disk_usage(ROOT).free / 2**30, 1),
         "warm": warm_state(),
+        # 这一批排队的进度：done 已出完（含失败 / 跳过），pending 还没开始
+        "queue": {"done": qstat["done"], "total": qstat["total"], "pending": len(queue),
+                  "next": [q["prompt"][:60] for q in queue[:5]]},
+        "te_disk": load_json(SETTINGS, {}).get("te_disk", False),
     }
 
 
@@ -1171,9 +1250,9 @@ class H(BaseHTTPRequestHandler):
                 if err:
                     return self.send(400, {"error": err})
             elif path == "/api/cancel":
-                cancel_generate()
+                cancel_generate(bool(req.get("all", True)))
             elif path == "/api/engine/load":
-                load_engine(bool(req.get("lowmem", True)))
+                load_engine(bool(req.get("te_disk", False)))
             elif path == "/api/engine/unload":
                 unload_engine()
             elif path == "/api/dl/add":
@@ -1204,7 +1283,7 @@ class H(BaseHTTPRequestHandler):
             elif path == "/api/quit":
                 self.send(200, {"ok": True})
                 stop_for_quit()
-                cancel_generate()
+                cancel_generate(bool(req.get("all", True)))
                 stop_engine()
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
