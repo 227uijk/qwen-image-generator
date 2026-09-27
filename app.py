@@ -816,7 +816,7 @@ def load_engine(te_disk):
 
 
 def unload_engine():
-    if job["running"]:
+    if job["running"] or queue:
         raise ValueError("正在生成，先取消再卸载")
     eng["want"] = False
     t = eng.get("timer")
@@ -855,7 +855,8 @@ def finish(record, b64=None):
 def fail(e):
     if job["cancelled"]:
         job["stage"] = "已取消"
-        schedule_preload()  # 引擎被关掉了，用户没点过释放就重新加载回来
+        if not queue:  # 引擎被关掉了，用户没点过释放就重新加载回来；还有排队的话下一张自己会启动
+            schedule_preload()
     else:
         job["stage"] = "失败"
         job["error"] = str(e)
@@ -968,21 +969,17 @@ def turbo_sigmas(nodes, w, h):
 
 
 def parse_params(req):
-    """校验并解析生成参数；出错抛 ValueError，此时任务还没占用。"""
-    prompt = (req.get("prompt") or "").strip()
-    if not prompt:
-        raise ValueError("提示词不能为空")
+    """校验并解析生成参数（提示词另外处理）；出错抛 ValueError。种子 -1 表示每张随机。"""
     try:
         w, h = (int(x) for x in str(req.get("size") or "512x512").split("x"))
         steps = max(1, min(80, int(req.get("steps") or 20)))
         cfg = float(req.get("cfg") or 1.0)
         seed = int(req.get("seed") if req.get("seed") is not None else -1)
+        count = max(1, min(50, int(req.get("count") or 1)))
     except (TypeError, ValueError):
-        raise ValueError("参数格式不对，检查一下尺寸 / 步数 / CFG / 种子")
-    if seed < 0:
-        seed = int.from_bytes(os.urandom(4), "big") & 0x7FFFFFFF
-    return {"prompt": prompt, "negative": (req.get("negative") or "").strip(), "size": f"{w}x{h}",
-            "w": w, "h": h, "steps": steps, "cfg": cfg, "seed": seed}
+        raise ValueError("参数格式不对，检查一下尺寸 / 步数 / CFG / 种子 / 张数")
+    return {"negative": (req.get("negative") or "").strip(), "size": f"{w}x{h}",
+            "w": w, "h": h, "steps": steps, "cfg": cfg, "seed": seed, "count": count}
 
 
 def decode_ref(ref):
@@ -997,44 +994,73 @@ def decode_ref(ref):
     return {"jpeg": "jpg"}.get(m[1], m[1]), data
 
 
-def claim_job():
-    with lock:
-        if job["running"]:
-            return False
-        job.update(running=True, stage="启动中", step=0, total=0, spi=None, log=[], error=None,
-                   output=None, started=time.time(), cancelled=False)
-        job.pop("t_first", None)
-        job.pop("t_step", None)
-        return True
+# ---------- 排队 ----------
+# 一次提交可以展开成多张：每张参考图 × 每条提示词 × 张数。引擎常驻，排队的图一张接一张出，
+# 同一条提示词的编码结果 sd.cpp 会缓存，后面几张不用再过文本编码器。
+
+queue = []  # 还没开始的图
+qstat = {"done": 0, "total": 0, "runner": None}
+MAX_QUEUE = 200
 
 
-def start_generate(req):
-    exe = sd_server()
+def out_path():
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    out, n = OUT / f"qwen_{stamp}.png", 2
+    while out.exists():  # 同一秒出了两张
+        out, n = OUT / f"qwen_{stamp}_{n}.png", n + 1
+    return stamp, out
+
+
+def build_items(req):
+    """把一次提交展开成排队项；参数有问题时返回错误文字。"""
     sel = selection()
-    ref = req.get("ref")
-    if sel["engine"] == "mlx":
-        return start_generate_mlx(req, sel)
-    need = ["dit", "te", "vae"] + (["vision"] if ref else [])
-    missing = ([] if exe else ["sd.cpp 程序"]) + [ROLES[r] for r in need if not sel[r]]
-    if missing:
-        return "还缺：" + "、".join(missing) + "（点右上角「模型」下载）"
+    mlx = sel["engine"] == "mlx"
+    refs = req.get("refs") or ([req["ref"]] if req.get("ref") else [])
+    if mlx:
+        missing = ([] if mlx_serve() else ["MLX-Serve 程序"]) + ([] if sel["mlx"] else ["MLX 模型包"])
+        if missing:
+            return "还缺：" + "、".join(missing) + "（点右上角「模型」下载「MLX 引擎套装」）"
+        if refs:
+            return "MLX 引擎的 Qwen 2.1 暂不支持参考图编辑，请切回 sd.cpp 引擎"
+    else:
+        need = ["dit", "te", "vae"] + (["vision"] if refs else [])
+        missing = ([] if sd_server() else ["sd.cpp 程序"]) + [ROLES[r] for r in need if not sel[r]]
+        if missing:
+            return "还缺：" + "、".join(missing) + "（点右上角「模型」下载）"
+    raw = (req.get("prompt") or "").strip()
+    prompts = [l.strip() for l in raw.splitlines() if l.strip()] if req.get("multi") else [raw]
+    if not raw:
+        return "提示词不能为空"
     try:
         prm = parse_params(req)
-        ref_img = decode_ref(ref) if ref else None
+        imgs = [decode_ref(r) for r in refs]
     except ValueError as e:
         return str(e)
-    if not claim_job():
-        return "已有任务在跑"
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    out = OUT / f"qwen_{stamp}.png"
+    total = max(1, len(imgs)) * len(prompts) * prm["count"]
+    if len(queue) + total > MAX_QUEUE:
+        return f"一次排太多了（{total} 张），队列最多 {MAX_QUEUE} 张"
     te_disk = bool(req.get("te_disk", False))
-    if load_json(SETTINGS, {}).get("te_disk", False) != te_disk:  # 记住，下次打开按这个预载
+    if not mlx and load_json(SETTINGS, {}).get("te_disk", False) != te_disk:  # 记住，下次打开按这个预载
         update_settings(lambda st: st.__setitem__("te_disk", te_disk))
-    fast = bool(req.get("fast", False))
+    items = []
+    for img in imgs or [None]:
+        for p in prompts:
+            for i in range(prm["count"]):
+                # 固定种子时连出的几张依次 +1，方便事后复现某一张
+                seed = prm["seed"] + i if prm["seed"] >= 0 else int.from_bytes(os.urandom(4), "big") & 0x7FFFFFFF
+                items.append({**prm, "prompt": p, "seed": seed, "ref": img, "sel": sel, "te_disk": te_disk,
+                              "fast": bool(req.get("fast", False))})
+    return items
+
+
+def run_sd(it):
+    sel, prm = it["sel"], dict(it)
+    fast = prm["fast"]
     nodes = turbo_nodes(sel["lora"])
     if nodes:  # 蒸馏过的 LoRA：步数、CFG 由它决定，反向提示词和 EasyCache 都用不上
         prm.update(steps=len(nodes), cfg=1.0, negative="")
         fast = False
+    stamp, out = out_path()
     body = {"prompt": prm["prompt"], "negative_prompt": prm["negative"], "width": prm["w"], "height": prm["h"],
             "seed": prm["seed"], "output_format": "png",
             "sample_params": {"sample_method": "euler", "sample_steps": prm["steps"],
@@ -1045,38 +1071,67 @@ def start_generate(req):
         body["lora"] = [{"path": sel["lora"], "multiplier": 1.0}]
     if nodes:
         body["sample_params"]["custom_sigmas"] = turbo_sigmas(nodes, prm["w"], prm["h"])
-    if ref_img:
-        body["ref_images"] = [base64.b64encode(ref_img[1]).decode()]
+    if prm["ref"]:
+        body["ref_images"] = [base64.b64encode(prm["ref"][1]).decode()]
     record = {"file": str(out), "name": out.name, "prompt": prm["prompt"], "negative": prm["negative"],
-              "size": prm["size"], "steps": prm["steps"], "cfg": prm["cfg"], "seed": prm["seed"], "ref": bool(ref_img),
-              "fast": fast, "time": stamp, "dit": Path(sel["dit"]).name, "te": Path(sel["te"]).name,
-              "lora": Path(sel["lora"]).stem if sel["lora"] else None}
-    threading.Thread(target=sd_worker, args=(sel, te_disk, body, record), daemon=True).start()
+              "size": prm["size"], "steps": prm["steps"], "cfg": prm["cfg"], "seed": prm["seed"],
+              "ref": bool(prm["ref"]), "fast": fast, "time": stamp, "dit": Path(sel["dit"]).name,
+              "te": Path(sel["te"]).name, "lora": Path(sel["lora"]).stem if sel["lora"] else None}
+    sd_worker(sel, it["te_disk"], body, record)
+
+
+def run_mlx(it):
+    stamp, out = out_path()
+    record = {"file": str(out), "name": out.name, "prompt": it["prompt"], "negative": it["negative"],
+              "size": it["size"], "steps": it["steps"], "cfg": it["cfg"], "seed": it["seed"], "ref": None,
+              "fast": False, "time": stamp, "engine": "mlx", "dit": Path(it["sel"]["mlx"]).name}
+    mlx_worker(record, it["sel"]["mlx"])
+
+
+def runner():
+    while True:
+        with lock:
+            if not queue or dl_state.get("quitting"):
+                qstat["runner"] = None
+                return
+            it = queue.pop(0)
+            job.update(running=True, stage="启动中", step=0, total=0, spi=None, log=[], error=None,
+                       output=None, started=time.time(), cancelled=False)
+            job.pop("t_first", None)
+            job.pop("t_step", None)
+        try:
+            (run_mlx if it["sel"]["engine"] == "mlx" else run_sd)(it)
+        except Exception as e:  # 工作函数自己会兜住错误，这里只防意外
+            job.update(running=False, stage="失败", error=str(e))
+        with lock:
+            qstat["done"] += 1
+            if job["error"] and queue:  # 出错多半是内存或模型问题，后面的也会失败，先停下
+                job["error"] += f"\n（后面排队的 {len(queue)} 张已取消）"
+                qstat["total"] -= len(queue)
+                queue.clear()
+
+
+def start_generate(req):
+    items = build_items(req)
+    if isinstance(items, str):
+        return items
+    with lock:
+        if not queue and not job["running"] and not qstat["runner"]:
+            qstat.update(done=0, total=0)
+        queue.extend(items)
+        qstat["total"] += len(items)
+        if not qstat["runner"]:
+            qstat["runner"] = threading.Thread(target=runner, daemon=True)
+            qstat["runner"].start()
     return None
 
 
-def start_generate_mlx(req, sel):
-    missing = ([] if mlx_serve() else ["MLX-Serve 程序"]) + ([] if sel["mlx"] else ["MLX 模型包"])
-    if missing:
-        return "还缺：" + "、".join(missing) + "（点右上角「模型」下载「MLX 引擎套装」）"
-    if req.get("ref"):
-        return "MLX 引擎的 Qwen 2.1 暂不支持参考图编辑，请切回 sd.cpp 引擎"
-    try:
-        prm = parse_params(req)
-    except ValueError as e:
-        return str(e)
-    if not claim_job():
-        return "已有任务在跑"
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    out = OUT / f"qwen_{stamp}.png"
-    record = {"file": str(out), "name": out.name, "prompt": prm["prompt"], "negative": prm["negative"],
-              "size": prm["size"], "steps": prm["steps"], "cfg": prm["cfg"], "seed": prm["seed"], "ref": None,
-              "fast": False, "time": stamp, "engine": "mlx", "dit": Path(sel["mlx"]).name}
-    threading.Thread(target=mlx_worker, args=(record, sel["mlx"]), daemon=True).start()
-    return None
-
-
-def cancel_generate():
+def cancel_generate(clear=True):
+    """clear=True 连同排队的一起取消；False 只跳过正在出的这张。"""
+    if clear:
+        with lock:
+            qstat["total"] -= len(queue)
+            queue.clear()
     if not job["running"]:
         return
     job["cancelled"] = True  # 进程还没起来时，由工作线程启动后自己检查
@@ -1131,6 +1186,9 @@ def status():
         "mem": avail_mem_gb(),
         "disk": round(shutil.disk_usage(ROOT).free / 2**30, 1),
         "warm": warm_state(),
+        # 这一批排队的进度：done 已出完（含失败 / 跳过），pending 还没开始
+        "queue": {"done": qstat["done"], "total": qstat["total"], "pending": len(queue),
+                  "next": [q["prompt"][:60] for q in queue[:5]]},
         "te_disk": load_json(SETTINGS, {}).get("te_disk", False),
     }
 
@@ -1192,7 +1250,7 @@ class H(BaseHTTPRequestHandler):
                 if err:
                     return self.send(400, {"error": err})
             elif path == "/api/cancel":
-                cancel_generate()
+                cancel_generate(bool(req.get("all", True)))
             elif path == "/api/engine/load":
                 load_engine(bool(req.get("te_disk", False)))
             elif path == "/api/engine/unload":
@@ -1225,7 +1283,7 @@ class H(BaseHTTPRequestHandler):
             elif path == "/api/quit":
                 self.send(200, {"ok": True})
                 stop_for_quit()
-                cancel_generate()
+                cancel_generate(bool(req.get("all", True)))
                 stop_engine()
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
