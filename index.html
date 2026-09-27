@@ -59,6 +59,9 @@
   select { appearance: none; -webkit-appearance: none; padding-right: 26px; cursor: pointer;
     background: var(--bg) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%238f877b' fill='none' stroke-width='1.4'/%3E%3C/svg%3E") no-repeat right 10px center; }
   .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 10px; }
+  input:disabled, select:disabled { opacity: .45; cursor: not-allowed; }
+  .toggle:has(input:disabled) { opacity: .45; cursor: not-allowed; }
+  .lock { color: var(--accent); }
   .field label { display: block; font-size: 11.5px; color: var(--mute); margin-bottom: 4px; }
   .drop { border: 1px dashed var(--line2); border-radius: 8px; padding: 12px; text-align: center; color: var(--mute);
           cursor: pointer; font-size: 12px; position: relative; transition: all .15s; }
@@ -232,8 +235,8 @@
               <option value="768x1024">768 × 1024 竖（慢）</option>
               <option value="1024x1024">1024 × 1024（很慢）</option>
             </select></div>
-          <div class="field"><label>步数</label><input id="steps" type="number" min="1" max="80" value="12"></div>
-          <div class="field"><label>CFG</label>
+          <div class="field"><label>步数 <span class="lock" data-lock hidden>· LoRA 固定</span></label><input id="steps" type="number" min="1" max="80" value="12"></div>
+          <div class="field"><label>CFG <span class="lock" data-lock hidden>· LoRA 固定</span></label>
             <select id="cfg">
               <option value="1">1 · 最快</option>
               <option value="3">3 · 手部/文字更好</option>
@@ -241,6 +244,7 @@
             </select></div>
           <div class="field"><label>种子（-1 随机）</label><input id="seed" type="number" value="-1"></div>
         </div>
+        <div class="hint lock" id="turboHint" hidden></div>
         <label class="toggle"><input type="checkbox" id="fast">
           <span>加速 EasyCache<small>跳过变化小的步，更快但画面会变糊，步数多（30+）时才建议开</small></span></label>
         <label class="toggle"><input type="checkbox" id="lowmem" checked>
@@ -348,8 +352,7 @@ function renderModels(s) {
   $('sel_lora').innerHTML = '<option value="">不用</option>'
     + loras.map(m => `<option value="${esc(m.file)}" ${m.file === s.sel.lora ? 'selected' : ''}>${esc(m.file)}</option>`).join('');
   $('sel_lora').disabled = !loras.length;
-  // 蒸馏加速 LoRA 自带步数，且不开 CFG
-  $('steps').disabled = $('cfg').disabled = !!s.turbo && s.sel.engine !== 'mlx';
+  lockTurbo(s.sel.engine !== 'mlx' && s.turbo);
   $('engineState').textContent = (s.engine ? 'sd.cpp ✓' : 'sd.cpp 未安装') + ' · ' + (s.mlx_engine ? 'MLX ✓' : 'MLX 未安装');
   const mlx = s.sel.engine === 'mlx';
   document.querySelectorAll('#engineSeg button').forEach(b => b.classList.toggle('on', b.dataset.e === s.sel.engine));
@@ -357,7 +360,7 @@ function renderModels(s) {
   $('engineHint').textContent = mlx
     ? (s.mlx_engine ? 'MLX 引擎：苹果 MLX 框架，不支持参考图；省内存 / 加速开关对它无效。' : 'MLX-Serve 程序还没装，去「管理」下载「MLX 引擎套装」。')
     : !s.engine ? 'sd.cpp 程序还没装，去「管理」下载「基础套装」。'
-    : s.turbo ? `加速 LoRA：固定 ${s.turbo} 步、CFG 1，步数 / CFG / 反向提示词 / EasyCache 不生效。` : '';
+    : '';
   const order = ['dit', 'te', 'vae', 'vision', 'lora', 'mlx', 'other'];
   const roleOpts = cur => order.map(r => `<option value="${r}" ${r === cur ? 'selected' : ''}>${esc(meta.roles[r] || r)}</option>`).join('');
   const models = [...s.models].sort((a, b) => order.indexOf(a.role) - order.indexOf(b.role));
@@ -383,6 +386,26 @@ document.querySelectorAll('#engineSeg button').forEach(b => b.onclick = async ()
 ['dit', 'te', 'vae', 'vision', 'lora', 'mlx'].forEach(role => $('sel_' + role).onchange = async e => {
   await api('/api/select', {role, file: e.target.value}); lastModelsKey = ''; poll();
 });
+
+// 蒸馏加速 LoRA 自带步数、不开 CFG：锁住相关输入，框里显示实际用的值，解锁时还原用户原来填的
+const turboFields = [['steps', 'value'], ['cfg', 'value'], ['negative', 'value'], ['fast', 'checked']];
+function lockTurbo(n) {
+  const locked = $('steps').disabled;
+  if (!!n === locked && (!n || $('steps').value == n)) return;
+  const forced = {steps: n, cfg: '1', negative: '', fast: false};
+  for (const [id, prop] of turboFields) {
+    const el = $(id);
+    if (n && !locked) el._keep = el[prop];
+    el[prop] = n ? forced[id] : el._keep ?? el[prop];
+    el.disabled = !!n;
+  }
+  $('negative').placeholder = n ? '反向提示词（加速 LoRA 下不生效）' : '反向提示词（可选，CFG > 1 时生效）';
+  document.querySelectorAll('[data-lock]').forEach(e => e.hidden = !n);
+  $('turboHint').hidden = !n;
+  $('turboHint').textContent = n ? `正在用加速 LoRA：固定 ${n} 步、CFG 1，反向提示词和 EasyCache 不生效。想自己调，把 LoRA 换成「不用」。` : '';
+}
+// 锁定时往输入框填值（如「复用参数」）要改的是解锁后还原的那份
+function setField(id, prop, v) { const el = $(id); if (el.disabled) el._keep = v; else el[prop] = v; }
 
 // ---------- 推荐预设 ----------
 let lastPresetsKey = '';
@@ -623,9 +646,9 @@ $('go').onclick = async () => {
 
 $('reuse').onclick = () => {
   if (!current) return;
-  $('prompt').value = current.prompt; $('negative').value = current.negative || '';
-  $('size').value = current.size; $('steps').value = current.steps;
-  $('cfg').value = String(current.cfg); $('seed').value = current.seed; $('fast').checked = !!current.fast;
+  $('prompt').value = current.prompt; setField('negative', 'value', current.negative || '');
+  $('size').value = current.size; setField('steps', 'value', current.steps);
+  setField('cfg', 'value', String(current.cfg)); $('seed').value = current.seed; setField('fast', 'checked', !!current.fast);
 };
 $('asRef').onclick = async () => {
   if (!current) return;
