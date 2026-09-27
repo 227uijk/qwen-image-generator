@@ -247,8 +247,8 @@
         <div class="hint lock" id="turboHint" hidden></div>
         <label class="toggle"><input type="checkbox" id="fast">
           <span>加速 EasyCache<small>跳过变化小的步，更快但画面会变糊，步数多（30+）时才建议开</small></span></label>
-        <label class="toggle"><input type="checkbox" id="lowmem" checked>
-          <span>省内存模式<small>文本编码器从磁盘读，16 GB 机器建议开</small></span></label>
+        <label class="toggle"><input type="checkbox" id="teDisk">
+          <span>文本编码器放磁盘<small>每张图多等约一分钟重读，只在生成时报内存不足才开</small></span></label>
       </div>
 
       <div class="dock">
@@ -358,7 +358,7 @@ function renderModels(s) {
   document.querySelectorAll('#engineSeg button').forEach(b => b.classList.toggle('on', b.dataset.e === s.sel.engine));
   $('sdSel').hidden = mlx; $('mlxSel').hidden = !mlx;
   $('engineHint').textContent = mlx
-    ? (s.mlx_engine ? 'MLX 引擎：苹果 MLX 框架，不支持参考图；省内存 / 加速开关对它无效。' : 'MLX-Serve 程序还没装，去「管理」下载「MLX 引擎套装」。')
+    ? (s.mlx_engine ? 'MLX 引擎：苹果 MLX 框架，不支持参考图；磁盘模式 / 加速开关对它无效。' : 'MLX-Serve 程序还没装，去「管理」下载「MLX 引擎套装」。')
     : !s.engine ? 'sd.cpp 程序还没装，去「管理」下载「基础套装」。'
     : '';
   const order = ['dit', 'te', 'vae', 'vision', 'lora', 'mlx', 'other'];
@@ -502,7 +502,7 @@ function renderChip(s) {
 }
 
 // ---------- 生成 ----------
-const clock = {start: null, end: null, eta: null};
+const clock = {start: null, end: null};
 function tick() {
   if (!clock.start) { $('eta').textContent = ''; return; }
   const now = Date.now();
@@ -520,13 +520,12 @@ function renderJob(s, ready) {
   if (j.total) stage += ` · ${j.step}/${j.total}`;
   if (j.spi) stage += ` · ${j.spi.toFixed(1)}s/步`;
   $('stage').textContent = stage;
-  // 轮询 1.5 秒一次，直接显示后台给的秒数会跳秒；记下起点，由本地每秒走表
+  // 后台给的是开始、预计结束的时刻（同一台机器，时钟一致），本地照着走表；
+  // 不用「已过秒数」，否则轮询响应慢时每次对表都会把秒表往回拽
   if (j.running) {
-    const start = Date.now() - j.elapsed * 1000;
-    if (!clock.start || Math.abs(clock.start - start) > 1500) clock.start = start;
-    // 剩余时间只在走完一步时才变，变了才重新对表，中间照常倒数
-    if (j.eta !== clock.eta) { clock.eta = j.eta; clock.end = j.eta != null ? Date.now() + j.eta * 1000 : null; }
-  } else clock.start = clock.end = clock.eta = null;
+    clock.start = j.started * 1000;
+    clock.end = j.end != null ? j.end * 1000 : null;
+  } else clock.start = clock.end = null;
   tick();
   $('prog').style.width = j.total ? (j.step / j.total * 100) + '%' : (j.running ? '3%' : '0');
   $('genErr').textContent = reqErr || j.error || '';
@@ -552,20 +551,25 @@ function renderEngine(s) {
   $('engBtn').dataset.state = s.warm;
   $('engBtn').disabled = s.job.running;
   $('engBtn').title = s.job.running ? '生成中' : (s.warm === 'off' ? '提前把模型读进内存，出图时就不用等加载' : '把模型从内存里卸掉（模型文件不会删）')
-    + (s.warm !== 'off' && $('lowmem').checked && s.sel.engine !== 'mlx' ? '\n省内存模式下文本编码器不常驻，每张图仍要从磁盘读一次；内存够的话关掉省内存模式就不用读了' : '');
+    + (s.warm !== 'off' && $('teDisk').checked && s.sel.engine !== 'mlx' ? '\n文本编码器放磁盘时不常驻，每张图仍要重读一次' : '');
 }
 $('engBtn').onclick = async () => {
   reqErr = '';
   try {
-    if ($('engBtn').dataset.state === 'off') await api('/api/engine/load', {lowmem: $('lowmem').checked});
+    if ($('engBtn').dataset.state === 'off') await api('/api/engine/load', {te_disk: $('teDisk').checked});
     else await api('/api/engine/unload', {});
   } catch (e) { reqErr = e.message; }
   poll();
 };
 
+let polling = false, pollAgain = false;
 async function poll() {
+  // 上一次还没回来就不叠着发（免得旧结果晚到覆盖新结果），等它回来再补一次
+  if (polling) { pollAgain = true; return; }
+  polling = true;
   try {
     const s = await api('/api/status');
+    if (firstPoll) $('teDisk').checked = !!s.te_disk;
     $('mem').innerHTML = s.mem == null ? '' : `内存 <b class="${s.mem < 6 ? 'warn' : ''}">${s.mem} GB</b>`;
     $('mem').title = s.mem < 6 ? '可用内存偏少，建议关掉些软件' : '当前可用内存';
     $('disk').innerHTML = `磁盘 <b>${s.disk} GB</b>`;
@@ -576,6 +580,9 @@ async function poll() {
     renderEngine(s);
   } catch (e) {
     $('stage').textContent = '后台服务已停止，重新打开「Qwen 生图」即可';
+  } finally {
+    polling = false;
+    if (pollAgain) { pollAgain = false; poll(); }
   }
 }
 
@@ -654,7 +661,7 @@ $('go').onclick = async () => {
     await api('/api/generate', {
       prompt: $('prompt').value, negative: $('negative').value, ref: refData,
       size: $('size').value, steps: +$('steps').value, cfg: +$('cfg').value,
-      seed: $('seed').value.trim() === '' ? -1 : +$('seed').value, lowmem: $('lowmem').checked, fast: $('fast').checked,
+      seed: $('seed').value.trim() === '' ? -1 : +$('seed').value, te_disk: $('teDisk').checked, fast: $('fast').checked,
     });
   } catch (e) { reqErr = e.message; }
   poll();
