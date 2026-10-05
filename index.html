@@ -657,15 +657,33 @@ function renderRefs() {
   });
   updatePlan();
 }
-function readFiles(files) {
+// sd.cpp 只认 PNG / JPG / WebP，也不管 EXIF 方向（iPhone 竖拍的照片会横着进去）；
+// 交给 WebKit 解码（HEIC 也行）、按显示方向重画一遍，顺便把超大照片缩到长边 2048 以内
+const REF_MAX = 2048;
+function normalizeRef(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file), img = new Image();
+    img.onload = () => {
+      const k = Math.min(1, REF_MAX / Math.max(img.naturalWidth, img.naturalHeight));
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.naturalWidth * k); c.height = Math.round(img.naturalHeight * k);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url);
+      // 可能带透明的格式存 PNG，照片存 JPG，免得请求体大好几倍
+      resolve(/png|gif|webp/.test(file.type) ? c.toDataURL('image/png') : c.toDataURL('image/jpeg', 0.95));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(); };
+    img.src = url;
+  });
+}
+async function readFiles(files) {
   const imgs = [...files].filter(f => f.type.startsWith('image/') && f.type !== 'image/svg+xml');
   reqErr = files.length && !imgs.length ? '参考图需要是 PNG / JPG 等图片文件' : '';
+  const out = await Promise.all(imgs.map(f => normalizeRef(f).catch(() => null)));
+  if (out.includes(null)) reqErr = '有图片读不出来，换成 PNG / JPG 试试';
+  refs.push(...out.filter(Boolean));
   $('genErr').textContent = reqErr;
-  imgs.forEach(f => {
-    const r = new FileReader();
-    r.onload = () => { refs.push(r.result); renderRefs(); };
-    r.readAsDataURL(f);
-  });
+  renderRefs();
 }
 $('drop').onclick = () => $('file').click();
 $('file').onchange = e => { readFiles(e.target.files); e.target.value = ''; };
@@ -734,7 +752,9 @@ document.addEventListener('keydown', e => {
 
 loadMeta().then(poll);
 loadHistory();
-setInterval(poll, 1500);
+// 窗口最小化或被挡住时不轮询（每次轮询后台都要扫模型目录、跑 vm_stat），回到前台立刻补一次
+setInterval(() => { if (!document.hidden) poll(); }, 1500);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
 </script>
 </body>
 </html>

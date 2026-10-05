@@ -654,6 +654,14 @@ def stop_engine():
     ENGINE_PID.unlink(missing_ok=True)
 
 
+def kill_group(p):
+    """关掉引擎整个进程组；进程可能刚好自己退出了，不算错。"""
+    try:
+        os.killpg(p.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+
+
 def kill_stale_engine():
     """上次异常退出留下的引擎还占着内存，启动时清掉。"""
     try:
@@ -824,7 +832,7 @@ def unload_engine():
         t.cancel()
     p = eng["proc"]
     if p and p.poll() is None:  # 先杀进程，正在进行的预热会马上失败退出、让出锁
-        os.killpg(p.pid, signal.SIGTERM)
+        kill_group(p)
 
     def clean():
         with eng_lock:
@@ -843,13 +851,14 @@ def warm_state():
 def finish(record, b64=None):
     if b64:
         Path(record["file"]).write_bytes(base64.b64decode(b64))
-    job["stage"] = "完成"
-    job["output"] = record["name"]
     record["seconds"] = round(time.time() - job["started"])
     with lock:
         h = load_history()
         h.append(record)
         save_history(h)
+    # 先写进历史再公布：前端一看到新的 output 就去拉历史，早了会找不到这张、也不会再展示它
+    job["stage"] = "完成"
+    job["output"] = record["name"]
 
 
 def fail(e):
@@ -1137,7 +1146,7 @@ def cancel_generate(clear=True):
     job["cancelled"] = True  # 进程还没起来时，由工作线程启动后自己检查
     p = job.get("proc")
     if p and p.poll() is None:  # 引擎没法中途打断一张图，只能关掉，之后在后台重新预载
-        os.killpg(p.pid, signal.SIGTERM)
+        kill_group(p)
 
 
 def delete_output(name):
@@ -1199,7 +1208,7 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def send(self, code, body, ctype="application/json; charset=utf-8"):
+    def send(self, code, body, ctype="application/json; charset=utf-8", cache="no-store"):
         if isinstance(body, (dict, list)):
             body = json.dumps(body, ensure_ascii=False).encode()
         elif isinstance(body, str):
@@ -1207,7 +1216,7 @@ class H(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache)
         self.end_headers()
         self.wfile.write(body)
 
@@ -1235,7 +1244,9 @@ class H(BaseHTTPRequestHandler):
                 if f and f.is_file():
                     ctype = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp"}.get(
                         f.suffix[1:].lower(), "application/octet-stream")
-                    return self.send(200, f.read_bytes(), ctype)
+                    # 生成的图文件名不重复、写完不再改，让浏览器缓存住：胶片条每次刷新、来回翻看都不用重新传整张 PNG
+                    cache = "max-age=31536000, immutable" if base == OUT else "no-store"
+                    return self.send(200, f.read_bytes(), ctype, cache)
         self.send(404, {"error": "not found"})
 
     def do_POST(self):
