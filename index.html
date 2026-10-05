@@ -608,7 +608,7 @@ async function loadHistory() {
   history = await api('/api/history');
   $('histCount').textContent = history.length ? `${history.length} 张` : '';
   $('history').innerHTML = history.map((h, i) =>
-    `<img loading="lazy" src="/outputs/${h.name}" data-i="${i}" title="${esc(h.prompt.slice(0, 200))}">`).join('')
+    `<img loading="lazy" src="/thumbs/${h.name}" data-i="${i}" title="${esc(h.prompt.slice(0, 200))}">`).join('')
     || '<div class="none">还没有作品，生成的图会按时间排在这里</div>';
   $('history').querySelectorAll('img').forEach(img => img.onclick = () => show(history[img.dataset.i]));
   if (!history.includes(current)) current = null;
