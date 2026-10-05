@@ -626,7 +626,11 @@ function show(h) {
   $('info').hidden = false;
   $('infoPrompt').textContent = h.prompt;
   $('infoPrompt').classList.remove('open');
-  $('infoMeta').textContent = `${h.size.replace('x', '×')} · ${h.steps}步 · CFG ${h.cfg}` + (h.seconds ? ` · ${fmt(h.seconds)}` : '')
+  // 分段耗时：时间主要花在采样还是 VAE，一眼能看出来
+  const t = h.timing || {}, parts = [['cond', '编码'], ['ref', '参考图'], ['sample', '采样'], ['vae', 'VAE']]
+    .filter(([k]) => t[k] >= 0.5).map(([k, n]) => `${n} ${Math.round(t[k])}s`);
+  $('infoMeta').textContent = `${h.size.replace('x', '×')} · ${h.steps}步 · CFG ${h.cfg}`
+    + (h.seconds ? ` · ${fmt(h.seconds)}` + (parts.length ? `（${parts.join(' · ')}）` : '') : '')
     + (h.fast ? ' · 加速' : '') + (h.ref ? ' · 图生图' : '') + (h.engine === 'mlx' ? ' · MLX' : '') + (h.lora ? ` · ${h.lora}` : '') + (h.dit ? ` · ${h.dit.replace(/\.(gguf|safetensors)$/, '')}` : '');
   $('infoMeta').title = `种子 ${h.seed}` + (h.te ? `\n文本编码器 ${h.te}` : '');
   $('history').querySelectorAll('img').forEach(img => {

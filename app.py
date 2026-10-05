@@ -570,6 +570,11 @@ def preset_view(sel, ts):
 # 同一时间只留一个引擎（sd-server 或 mlx-serve）；换模型、换引擎、切文本编码器放磁盘时重启。
 
 PROG = re.compile(r"\|\s*(\d+)/(\d+)\s*-\s*([\d.]+)(s/it|it/s)")
+# sd.cpp 每个阶段结束时打一行耗时，记进历史，好看出时间花在哪（也给 tools/bench.py 用）
+TIMING = re.compile(r"\b(apply_loras|get_learned_condition|encode_first_stage|sampling|decode_first_stage|generate_image)"
+                    r" completed(?:,)? (?:taking|in) ([\d.]+)s")
+TIMING_KEYS = {"apply_loras": "lora", "get_learned_condition": "cond", "encode_first_stage": "ref",
+               "sampling": "sample", "decode_first_stage": "vae", "generate_image": "total"}
 ENGINE_PID = TMP / "engine.pid"
 eng_lock = threading.Lock()  # 同一时间只有一个线程在启动 / 使用引擎
 # want：用户想让模型常驻（点了「加载模型」或出过图），点「卸载」后为 False
@@ -608,6 +613,9 @@ def log_line(line):
 
 def sd_line(line):
     live = job["running"] and not eng["warming"]  # 预热那张图的进度不算进任务
+    t = TIMING.search(line)
+    if t and live:
+        job.setdefault("timing", {})[TIMING_KEYS[t[1]]] = round(float(t[2]), 1)
     m = PROG.search(line)
     if m:
         if not live:
@@ -784,6 +792,10 @@ def run_sd_job(body):
         except Exception:
             continue  # 偶尔超时不要紧，进程还活着就接着等
         if s["status"] == "completed":
+            for _ in range(10):  # 收尾的耗时行可能还在管道里，稍等它被读到
+                if "total" in job.get("timing", {}) or eng["warming"]:
+                    break
+                time.sleep(0.05)
             return s["result"]["images"][0]["b64_json"]
         if s["status"] in ("failed", "cancelled"):
             raise RuntimeError((s.get("error") or {}).get("message") or "生成失败")
@@ -885,6 +897,8 @@ def finish(record, b64=None):
     if b64:
         Path(record["file"]).write_bytes(base64.b64decode(b64))
     record["seconds"] = round(time.time() - job["started"])
+    if job.get("timing"):
+        record["timing"] = dict(job["timing"])
     with lock:
         h = load_history()
         h.append(record)
@@ -1143,6 +1157,7 @@ def runner():
                        output=None, started=time.time(), cancelled=False)
             job.pop("t_first", None)
             job.pop("t_step", None)
+            job.pop("timing", None)
         try:
             (run_mlx if it["sel"]["engine"] == "mlx" else run_sd)(it)
         except Exception as e:  # 工作函数自己会兜住错误，这里只防意外
