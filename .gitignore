@@ -22,3 +22,6 @@ __pycache__/
 *.pyc
 .claude/
 launcher/.build/
+
+# 测速脚本的输出（tools/bench.py）
+bench_out/

@@ -28,10 +28,11 @@ BIN = ROOT / "bin"
 MODELS = ROOT / "models"
 OUT = ROOT / "outputs"
 TMP = ROOT / "tmp"
+THUMBS = TMP / "thumbs"
 HISTORY = ROOT / "history.json"
 SETTINGS = ROOT / "settings.json"
 DOWNLOADS = ROOT / "downloads.json"
-for d in (BIN, MODELS, OUT, TMP):
+for d in (BIN, MODELS, OUT, TMP, THUMBS):
     d.mkdir(exist_ok=True)
 
 ROLES = {"dit": "生图模型", "te": "文本编码器", "vae": "VAE", "vision": "视觉组件",
@@ -264,16 +265,32 @@ def fetch_url(t, url):
     return url, proxy
 
 
+def http_error(code):
+    """链接本身有问题（重试也没用）时给出提示，否则 None。"""
+    if code == "404":
+        return "链接不存在（404）"
+    if code in ("401", "403"):
+        return f"没有访问权限（{code}），可能需要先在网页上同意模型协议"
+    return None
+
+
 def remote_size(url, proxy):
+    """HEAD 一下拿文件大小，返回 (大小, 错误提示)。
+    HF 上链接写错 / 没权限时第一跳就会报错：直接判死，不然 curl 带着 --retry-all-errors 要白白重试一分多钟。"""
     try:
-        out = subprocess.run(curl_base(proxy) + ["-I", url], capture_output=True, text=True, timeout=40).stdout
+        # 不带 --fail，好拿到每一跳的状态行
+        out = subprocess.run([a for a in curl_base(proxy) if a != "--fail"] + ["-I", url],
+                             capture_output=True, text=True, timeout=40).stdout
     except Exception:
-        return None
-    sizes = re.findall(r"^(?:x-linked-size|content-length):\s*(\d+)", out, re.I | re.M)
-    # 重定向链里最后一个是真实文件；x-linked-size 是 HF 给的真实大小
+        return None, None
+    codes = re.findall(r"^HTTP/[\d.]+ (\d{3})", out, re.M)
+    if codes and re.match(r"https://(huggingface\.co|hf-mirror\.com)/", url) and http_error(codes[0]):
+        return None, http_error(codes[0])
+    # x-linked-size 是 HF 在第一跳给的真实大小；否则只信最后一跳成功时的 content-length
     linked = re.findall(r"^x-linked-size:\s*(\d+)", out, re.I | re.M)
-    val = int(linked[-1]) if linked else (int(sizes[-1]) if sizes else 0)
-    return val if val > 1024 else None
+    sizes = re.findall(r"^content-length:\s*(\d+)", out.split("HTTP/")[-1], re.I | re.M)
+    val = int(linked[-1]) if linked else (int(sizes[-1]) if sizes and codes and codes[-1].startswith("2") else 0)
+    return (val if val > 1024 else None), None
 
 
 def dest_of(t):
@@ -317,7 +334,12 @@ def postprocess(t):
 
 def run_task(t):
     url, proxy = fetch_url(t, t["url"])
-    size = t.get("size") or remote_size(url, proxy)
+    size = t.get("size")
+    if not size:
+        size, fatal = remote_size(url, proxy)
+        if fatal:
+            update_task(t["id"], status="error", error=fatal)
+            return
     if size:
         update_task(t["id"], size=size)
     final, part = dest_of(t), part_of(t)
@@ -348,9 +370,7 @@ def run_task(t):
             part.unlink(missing_ok=True)
         fatal = re.search(r"error: (401|403|404)", err or "") if p.returncode == 22 else None
         if fatal:
-            code = fatal[1]
-            msg = {"404": "链接不存在（404）"}.get(code, f"没有访问权限（{code}），可能需要先在网页上同意模型协议")
-            update_task(t["id"], status="error", error=msg)
+            update_task(t["id"], status="error", error=http_error(fatal[1]))
             return
         update_task(t["id"], error=(err or "").strip()[-200:] or f"curl 退出码 {p.returncode}，重试中…")
         time.sleep(5)
@@ -420,9 +440,13 @@ def add_download(url, role, name, source):
     with dl_lock:
         # 文件已被删掉（或程序包解压后已清理）的「已完成」任务不算数，否则没法重新下载
         ts = [t for t in tasks() if not (t["status"] == "done" and not dest_of(t).exists())]
-        known = {t["dest"] for t in ts if t["status"] != "error"}
+        known = {t["dest"]: t for t in ts}
         for u, dest, size in entries:
-            if dest in known:
+            old = known.get(dest)
+            if old:  # 同一个文件不重复建任务；暂停或出错的就地重新排队（比如点预设「补齐」）
+                if old["status"] in ("paused", "error"):
+                    old.update(status="queued", error=None, url=u, source=source)
+                    added += 1
                 continue
             ts.append({"id": uuid.uuid4().hex[:10], "url": u, "role": role, "dest": dest, "size": size,
                        "name": Path(dest).name, "status": "queued", "error": None, "source": source})
@@ -518,16 +542,20 @@ def preset_item_dest(it):
 
 def preset_view(sel, ts):
     """每个预设的状态：done 全都有了 / busy 还在队列里 / partial 缺一部分 / none 都没有。"""
-    pending = [t["dest"] for t in ts if t["status"] != "done"]
+    # 暂停 / 出错的不算「下载中」，算缺（整个仓库只要有一个文件没下完也算缺）：按钮保持可点，点了会把它们重新排队
+    active = [t["dest"] for t in ts if t["status"] in ("queued", "downloading")]
+    stalled = [t["dest"] for t in ts if t["status"] in ("paused", "error")]
     used = {v for k, v in sel.items() if k != "engine" and v}
     out = []
     for p in PRESETS:
         have, busy, missing, in_use = 0, 0, [], False
         for i, it in enumerate(p["items"]):
             dest = preset_item_dest(it)
-            if any(d == dest or d.startswith(dest + "/") for d in pending):
+            under = lambda ds: any(d == dest or d.startswith(dest + "/") for d in ds)
+            if under(active):
                 busy += 1
-            elif program_installed(it) if it["role"] in ("engine", "mlx_engine") else (ROOT / dest).exists():
+            elif not under(stalled) and (program_installed(it) if it["role"] in ("engine", "mlx_engine")
+                                         else (ROOT / dest).exists()):
                 have += 1
                 in_use |= dest.startswith("models/") and dest[len("models/"):] in used
             else:
@@ -542,6 +570,11 @@ def preset_view(sel, ts):
 # 同一时间只留一个引擎（sd-server 或 mlx-serve）；换模型、换引擎、切文本编码器放磁盘时重启。
 
 PROG = re.compile(r"\|\s*(\d+)/(\d+)\s*-\s*([\d.]+)(s/it|it/s)")
+# sd.cpp 每个阶段结束时打一行耗时，记进历史，好看出时间花在哪（也给 tools/bench.py 用）
+TIMING = re.compile(r"\b(apply_loras|get_learned_condition|encode_first_stage|sampling|decode_first_stage|generate_image)"
+                    r" completed(?:,)? (?:taking|in) ([\d.]+)s")
+TIMING_KEYS = {"apply_loras": "lora", "get_learned_condition": "cond", "encode_first_stage": "ref",
+               "sampling": "sample", "decode_first_stage": "vae", "generate_image": "total"}
 ENGINE_PID = TMP / "engine.pid"
 eng_lock = threading.Lock()  # 同一时间只有一个线程在启动 / 使用引擎
 # want：用户想让模型常驻（点了「加载模型」或出过图），点「卸载」后为 False
@@ -580,6 +613,9 @@ def log_line(line):
 
 def sd_line(line):
     live = job["running"] and not eng["warming"]  # 预热那张图的进度不算进任务
+    t = TIMING.search(line)
+    if t and live:
+        job.setdefault("timing", {})[TIMING_KEYS[t[1]]] = round(float(t[2]), 1)
     m = PROG.search(line)
     if m:
         if not live:
@@ -652,6 +688,14 @@ def stop_engine():
                 pass
     eng.update(proc=None, key=None, port=None)
     ENGINE_PID.unlink(missing_ok=True)
+
+
+def kill_group(p):
+    """关掉引擎整个进程组；进程可能刚好自己退出了，不算错。"""
+    try:
+        os.killpg(p.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
 
 
 def kill_stale_engine():
@@ -748,6 +792,10 @@ def run_sd_job(body):
         except Exception:
             continue  # 偶尔超时不要紧，进程还活着就接着等
         if s["status"] == "completed":
+            for _ in range(10):  # 收尾的耗时行可能还在管道里，稍等它被读到
+                if "total" in job.get("timing", {}) or eng["warming"]:
+                    break
+                time.sleep(0.05)
             return s["result"]["images"][0]["b64_json"]
         if s["status"] in ("failed", "cancelled"):
             raise RuntimeError((s.get("error") or {}).get("message") or "生成失败")
@@ -779,9 +827,14 @@ def lock_engine():
 
 def preload():
     """把当前选中的模型提前加载进引擎；条件不满足时关掉引擎释放内存。"""
-    if dl_state.get("quitting") or not eng["want"]:
+    # 队列在跑时不插手：排队的图各自带着提交时选的模型，这时按新选择换引擎，下一张又会换回去，
+    # 来回整套重载。队列排完后 runner 会再调一次，那时再换成新选的
+    busy = lambda: job["running"] or queue
+    if dl_state.get("quitting") or not eng["want"] or busy():
         return
     with eng_lock:
+        if busy():
+            return
         try:
             sel = selection()
             if sel["engine"] == "mlx":
@@ -824,7 +877,7 @@ def unload_engine():
         t.cancel()
     p = eng["proc"]
     if p and p.poll() is None:  # 先杀进程，正在进行的预热会马上失败退出、让出锁
-        os.killpg(p.pid, signal.SIGTERM)
+        kill_group(p)
 
     def clean():
         with eng_lock:
@@ -843,13 +896,16 @@ def warm_state():
 def finish(record, b64=None):
     if b64:
         Path(record["file"]).write_bytes(base64.b64decode(b64))
-    job["stage"] = "完成"
-    job["output"] = record["name"]
     record["seconds"] = round(time.time() - job["started"])
+    if job.get("timing"):
+        record["timing"] = dict(job["timing"])
     with lock:
         h = load_history()
         h.append(record)
         save_history(h)
+    # 先写进历史再公布：前端一看到新的 output 就去拉历史，早了会找不到这张、也不会再展示它
+    job["stage"] = "完成"
+    job["output"] = record["name"]
 
 
 def fail(e):
@@ -1093,12 +1149,15 @@ def runner():
         with lock:
             if not queue or dl_state.get("quitting"):
                 qstat["runner"] = None
+                if eng_alive():  # 排队期间换过模型的话，现在换成新选的（没换则什么都不做）
+                    schedule_preload()
                 return
             it = queue.pop(0)
             job.update(running=True, stage="启动中", step=0, total=0, spi=None, log=[], error=None,
                        output=None, started=time.time(), cancelled=False)
             job.pop("t_first", None)
             job.pop("t_step", None)
+            job.pop("timing", None)
         try:
             (run_mlx if it["sel"]["engine"] == "mlx" else run_sd)(it)
         except Exception as e:  # 工作函数自己会兜住错误，这里只防意外
@@ -1137,13 +1196,31 @@ def cancel_generate(clear=True):
     job["cancelled"] = True  # 进程还没起来时，由工作线程启动后自己检查
     p = job.get("proc")
     if p and p.poll() is None:  # 引擎没法中途打断一张图，只能关掉，之后在后台重新预载
-        os.killpg(p.pid, signal.SIGTERM)
+        kill_group(p)
+
+
+def thumb_of(f):
+    """胶片条用的小图（长边 160，JPG）。原图 1024² 解码后占 4 MB 内存，历史一多 WebKit 就吃掉上 G，
+    16 GB 的机器上和模型抢内存。用系统自带的 sips 第一次请求时生成，做不了就退回原图。"""
+    t = THUMBS / (f.stem + ".jpg")
+    if t.exists():
+        return t
+    tmp = THUMBS / f".{uuid.uuid4().hex}.jpg"  # 同一张可能被几个请求同时要，先写临时文件再换上
+    try:
+        subprocess.run(["sips", "-s", "format", "jpeg", "-s", "formatOptions", "85", "-Z", "160", str(f),
+                        "--out", str(tmp)], capture_output=True, timeout=30, check=True)
+        tmp.replace(t)
+        return t
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        return f
 
 
 def delete_output(name):
     f = inside(OUT, Path(name).name)
     if f and f.exists():
         to_trash(f)
+        (THUMBS / (f.stem + ".jpg")).unlink(missing_ok=True)
     with lock:
         save_history([r for r in load_history() if r.get("name") != Path(name).name])
 
@@ -1199,7 +1276,7 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
-    def send(self, code, body, ctype="application/json; charset=utf-8"):
+    def send(self, code, body, ctype="application/json; charset=utf-8", cache="no-store"):
         if isinstance(body, (dict, list)):
             body = json.dumps(body, ensure_ascii=False).encode()
         elif isinstance(body, str):
@@ -1207,7 +1284,7 @@ class H(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache)
         self.end_headers()
         self.wfile.write(body)
 
@@ -1229,13 +1306,17 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, {"roles": ROLES, "presets": PRESETS})
         if path == "/api/history":
             return self.send(200, [r for r in load_history() if (OUT / r["name"]).exists()][::-1])
-        for prefix, base in (("/outputs/", OUT), ("/tmp/", TMP)):
+        for prefix, base in (("/outputs/", OUT), ("/thumbs/", OUT), ("/tmp/", TMP)):
             if path.startswith(prefix):
                 f = inside(base, path[len(prefix):])
                 if f and f.is_file():
+                    if prefix == "/thumbs/":
+                        f = thumb_of(f)
                     ctype = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp"}.get(
                         f.suffix[1:].lower(), "application/octet-stream")
-                    return self.send(200, f.read_bytes(), ctype)
+                    # 生成的图文件名不重复、写完不再改，让浏览器缓存住：胶片条每次刷新、来回翻看都不用重新传整张 PNG
+                    cache = "max-age=31536000, immutable" if base == OUT else "no-store"
+                    return self.send(200, f.read_bytes(), ctype, cache)
         self.send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -1295,12 +1376,6 @@ class H(BaseHTTPRequestHandler):
 
 
 def main():
-    # 上次异常退出时停在“下载中”的任务改回排队，打开后自动续传
-    ts = tasks()
-    for t in ts:
-        if t["status"] == "downloading":
-            t["status"] = "queued"
-    save_tasks(ts)
     url = f"http://127.0.0.1:{PORT}/"
     try:
         srv = ThreadingHTTPServer(("127.0.0.1", PORT), H)
@@ -1308,6 +1383,13 @@ def main():
         if os.environ.get("QWEN_NO_BROWSER") != "1":
             webbrowser.open(url)
         return
+    # 上次异常退出时停在“下载中”的任务改回排队，打开后自动续传。
+    # 必须在占到端口之后做：否则多开一次就会把正在跑的那个实例的任务状态改掉，它下完了也不收尾
+    ts = tasks()
+    for t in ts:
+        if t["status"] == "downloading":
+            t["status"] = "queued"
+    save_tasks(ts)
     if any(t["status"] == "queued" for t in ts):
         kick_worker()
     kill_stale_engine()
