@@ -1123,6 +1123,11 @@ def run_sd(it):
                               "guidance": {"txt_cfg": prm["cfg"]}},
             # EasyCache：相邻步变化小时跳过计算
             "cache_mode": "easycache" if fast else "disabled"}
+    if fast:
+        # sd.cpp 默认阈值 0.2 是累计变化量：步数越多每步变化越小、跳得越多，20 步跳 11 步，
+        # 40 步实际算的步数也差不多，画质反而不如不加速。阈值按步数反比缩放，跳过的比例就大致固定（估算
+        # 约三成，未实测），步数加多真算的步数也跟着多；开头 20% 定构图、最后 10% 出细节，都不跳
+        body["cache_option"] = f"threshold={1.0 / prm['steps']:.4f},start=0.2,end=0.9"
     if sel["lora"]:
         body["lora"] = [{"path": sel["lora"], "multiplier": 1.0}]
     if nodes:
