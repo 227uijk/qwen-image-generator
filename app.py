@@ -1221,6 +1221,19 @@ def thumb_of(f):
         return f
 
 
+def live_history():
+    """历史里只留图片还在的；在访达里手动删掉的，顺手把记录和缩略图也清掉。"""
+    with lock:
+        h = load_history()
+        keep = [r for r in h if (OUT / r["name"]).exists()]
+        if len(keep) != len(h):
+            save_history(keep)
+            for r in h:
+                if r not in keep:
+                    (THUMBS / (Path(r["name"]).stem + ".jpg")).unlink(missing_ok=True)
+    return keep
+
+
 def delete_output(name):
     f = inside(OUT, Path(name).name)
     if f and f.exists():
@@ -1310,7 +1323,7 @@ class H(BaseHTTPRequestHandler):
         if path == "/api/meta":
             return self.send(200, {"roles": ROLES, "presets": PRESETS})
         if path == "/api/history":
-            return self.send(200, [r for r in load_history() if (OUT / r["name"]).exists()][::-1])
+            return self.send(200, live_history()[::-1])
         for prefix, base in (("/outputs/", OUT), ("/thumbs/", OUT), ("/tmp/", TMP)):
             if path.startswith(prefix):
                 f = inside(base, path[len(prefix):])

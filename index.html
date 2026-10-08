@@ -604,15 +604,22 @@ async function poll() {
 }
 
 // ---------- 历史 ----------
-async function loadHistory() {
-  history = await api('/api/history');
+async function loadHistory(onlyIfChanged = false) {
+  const fresh = await api('/api/history');
+  const names = l => l.map(h => h.name).join('|');
+  if (onlyIfChanged && names(fresh) === names(history)) return;
+  const curName = current?.name, curIdx = history.indexOf(current);
+  history = fresh;
+  // 刷新后是新对象，按文件名找回正在看的那张；它被删了就看原位置附近那张
+  current = history.find(h => h.name === curName) || null;
+  if (!current && curName && history.length) current = history[Math.min(Math.max(curIdx, 0), history.length - 1)];
   $('histCount').textContent = history.length ? `${history.length} 张` : '';
   $('history').innerHTML = history.map((h, i) =>
     `<img loading="lazy" src="/thumbs/${h.name}" data-i="${i}" title="${esc(h.prompt.slice(0, 200))}">`).join('')
     || '<div class="none">还没有作品，生成的图会按时间排在这里</div>';
   $('history').querySelectorAll('img').forEach(img => img.onclick = () => show(history[img.dataset.i]));
-  if (!history.includes(current)) current = null;
-  if (!current && history.length) show(history[0]);
+  if (current) show(current);
+  else if (history.length) show(history[0]);
   if (!history.length) {
     $('viewer').innerHTML = '<div class="empty"><div class="big">暗房是空的</div>写好提示词，按 ⌘↩ 冲洗第一张</div>';
     $('info').hidden = true;
@@ -758,7 +765,10 @@ loadMeta().then(poll);
 loadHistory();
 // 窗口最小化或被挡住时不轮询（每次轮询后台都要扫模型目录、跑 vm_stat），回到前台立刻补一次
 setInterval(() => { if (!document.hidden) poll(); }, 1500);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) { poll(); loadHistory(true); } });
+// 在访达里手动删了图，切回窗口或几秒内历史就跟着更新
+window.addEventListener('focus', () => loadHistory(true));
+setInterval(() => { if (!document.hidden) loadHistory(true); }, 5000);
 </script>
 </body>
 </html>
