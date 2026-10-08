@@ -1123,6 +1123,11 @@ def run_sd(it):
                               "guidance": {"txt_cfg": prm["cfg"]}},
             # EasyCache：相邻步变化小时跳过计算
             "cache_mode": "easycache" if fast else "disabled"}
+    if fast:
+        # sd.cpp 默认阈值 0.2 是累计变化量：步数越多每步变化越小、跳得越多，20 步跳 11 步，
+        # 40 步实际算的步数也差不多，画质反而不如不加速。阈值按步数反比缩放，跳过的比例就大致固定（估算
+        # 约三成，未实测），步数加多真算的步数也跟着多；开头 20% 定构图、最后 10% 出细节，都不跳
+        body["cache_option"] = f"threshold={1.0 / prm['steps']:.4f},start=0.2,end=0.9"
     if sel["lora"]:
         body["lora"] = [{"path": sel["lora"], "multiplier": 1.0}]
     if nodes:
@@ -1216,6 +1221,19 @@ def thumb_of(f):
         return f
 
 
+def live_history():
+    """历史里只留图片还在的；在访达里手动删掉的，顺手把记录和缩略图也清掉。"""
+    with lock:
+        h = load_history()
+        keep = [r for r in h if (OUT / r["name"]).exists()]
+        if len(keep) != len(h):
+            save_history(keep)
+            for r in h:
+                if r not in keep:
+                    (THUMBS / (Path(r["name"]).stem + ".jpg")).unlink(missing_ok=True)
+    return keep
+
+
 def delete_output(name):
     f = inside(OUT, Path(name).name)
     if f and f.exists():
@@ -1305,7 +1323,7 @@ class H(BaseHTTPRequestHandler):
         if path == "/api/meta":
             return self.send(200, {"roles": ROLES, "presets": PRESETS})
         if path == "/api/history":
-            return self.send(200, [r for r in load_history() if (OUT / r["name"]).exists()][::-1])
+            return self.send(200, live_history()[::-1])
         for prefix, base in (("/outputs/", OUT), ("/thumbs/", OUT), ("/tmp/", TMP)):
             if path.startswith(prefix):
                 f = inside(base, path[len(prefix):])
