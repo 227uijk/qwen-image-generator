@@ -77,7 +77,8 @@ PRESETS = [
 
 lock = threading.Lock()
 job = {"running": False, "stage": "空闲", "step": 0, "total": 0, "spi": None, "log": [],
-       "error": None, "output": None, "proc": None, "started": None, "cancelled": False}
+       "error": None, "output": None, "proc": None, "started": None, "cancelled": False,
+       "owns_engine": False}
 
 
 # ---------- 通用 ----------
@@ -345,6 +346,8 @@ def run_task(t):
     final, part = dest_of(t), part_of(t)
     final.parent.mkdir(parents=True, exist_ok=True)
     if final.exists() and (not size or final.stat().st_size == size):
+        # 程序包上次下完了但解压 / 清理出错：文件还在，补做一遍，不然一直「已完成」却没装上
+        postprocess(t)
         update_task(t["id"], status="done", error=None)
         return
     cmd = curl_base(proxy) + ["-C", "-", "--retry", "20", "--retry-delay", "3", "--retry-all-errors",
@@ -924,6 +927,7 @@ def sd_worker(sel, te_disk, body, record):
                lora_name=Path(sel["lora"]).name.lower() if sel["lora"] else None)
     try:
         lock_engine()
+        job["owns_engine"] = True
         try:
             if not (eng_alive() and eng["key"] == sd_key(sel, te_disk)):
                 job["stage"] = "启动引擎"
@@ -934,6 +938,7 @@ def sd_worker(sel, te_disk, body, record):
             job["stage"] = "编码提示词"
             b64 = run_sd_job(body)
         finally:
+            job["owns_engine"] = False
             eng_lock.release()
         finish(record, b64)
     except Exception as e:
@@ -950,6 +955,7 @@ def mlx_worker(record, pack):
     eng["want"] = True
     try:
         lock_engine()
+        job["owns_engine"] = True
         try:
             if not (eng_alive() and eng["key"] == ("mlx", pack)):
                 job["stage"] = "加载模型"
@@ -994,12 +1000,15 @@ def mlx_worker(record, pack):
                 if ev.get("error"):
                     raise RuntimeError(str(ev["error"]))
         finally:
+            job["owns_engine"] = False
             eng_lock.release()
         if not b64:
             raise RuntimeError("MLX-Serve 没有返回图片，看运行日志")
         finish(record, b64)
     except Exception as e:
         fail(http_detail(e))
+        if job["error"]:
+            job["error"] += "\n" + "\n".join(job["log"][-12:])
     finally:
         job["running"] = False
         job["proc"] = None
@@ -1030,10 +1039,14 @@ def parse_params(req):
         w, h = (int(x) for x in str(req.get("size") or "512x512").split("x"))
         steps = max(1, min(80, int(req.get("steps") or 20)))
         cfg = float(req.get("cfg") or 1.0)
+        if not (0 < cfg <= 20):
+            raise ValueError
+        if not all(256 <= v <= 2048 and v % 16 == 0 for v in (w, h)):  # Qwen 的潜空间按 16 像素一格
+            raise ValueError
         seed = int(req.get("seed") if req.get("seed") is not None else -1)
         count = max(1, min(50, int(req.get("count") or 1)))
     except (TypeError, ValueError):
-        raise ValueError("参数格式不对，检查一下尺寸 / 步数 / CFG / 种子 / 张数")
+        raise ValueError("参数格式不对，检查一下尺寸（256–2048、16 的倍数）/ 步数 / CFG / 种子 / 张数")
     return {"negative": (req.get("negative") or "").strip(), "size": f"{w}x{h}",
             "w": w, "h": h, "steps": steps, "cfg": cfg, "seed": seed, "count": count}
 
@@ -1199,7 +1212,8 @@ def cancel_generate(clear=True):
     if not job["running"]:
         return
     job["cancelled"] = True  # 进程还没起来时，由工作线程启动后自己检查
-    p = job.get("proc")
+    # 还在启动引擎 / 加载模型时 job["proc"] 还没设上（MLX 加载能等好几分钟），这张占着引擎的话直接关它
+    p = job.get("proc") or (eng["proc"] if job.get("owns_engine") else None)
     if p and p.poll() is None:  # 引擎没法中途打断一张图，只能关掉，之后在后台重新预载
         kill_group(p)
 
@@ -1324,7 +1338,7 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, {"roles": ROLES, "presets": PRESETS})
         if path == "/api/history":
             return self.send(200, live_history()[::-1])
-        for prefix, base in (("/outputs/", OUT), ("/thumbs/", OUT), ("/tmp/", TMP)):
+        for prefix, base in (("/outputs/", OUT), ("/thumbs/", OUT)):
             if path.startswith(prefix):
                 f = inside(base, path[len(prefix):])
                 if f and f.is_file():
@@ -1333,8 +1347,7 @@ class H(BaseHTTPRequestHandler):
                     ctype = {"png": "image/png", "jpg": "image/jpeg", "webp": "image/webp"}.get(
                         f.suffix[1:].lower(), "application/octet-stream")
                     # 生成的图文件名不重复、写完不再改，让浏览器缓存住：胶片条每次刷新、来回翻看都不用重新传整张 PNG
-                    cache = "max-age=31536000, immutable" if base == OUT else "no-store"
-                    return self.send(200, f.read_bytes(), ctype, cache)
+                    return self.send(200, f.read_bytes(), ctype, "max-age=31536000, immutable")
         self.send(404, {"error": "not found"})
 
     def do_POST(self):
