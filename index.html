@@ -245,8 +245,8 @@
               <option value="768x1024">768 × 1024 竖（慢）</option>
               <option value="1024x1024">1024 × 1024（很慢）</option>
             </select></div>
-          <div class="field"><label>步数 <span class="lock" data-lock hidden>· LoRA 固定</span></label><input id="steps" type="number" min="1" max="80" value="12"></div>
-          <div class="field"><label>CFG <span class="lock" data-lock hidden>· LoRA 固定</span></label>
+          <div class="field"><label>步数</label><input id="steps" type="number" min="1" max="80" value="12"></div>
+          <div class="field"><label>CFG</label>
             <select id="cfg">
               <option value="1">1 · 最快</option>
               <option value="3">3 · 手部/文字更好</option>
@@ -255,7 +255,6 @@
           <div class="field"><label>种子（-1 随机）</label><input id="seed" type="number" value="-1"></div>
           <div class="field"><label>每组张数 <span class="lock" id="seedHint"></span></label><input id="count" type="number" min="1" max="50" value="1"></div>
         </div>
-        <div class="hint lock" id="turboHint" hidden></div>
         <label class="toggle"><input type="checkbox" id="fast">
           <span>加速 EasyCache<small>跳过部分变化小的步，更快、细节略有损失；跳过比例不随步数增加</small></span></label>
         <label class="toggle"><input type="checkbox" id="teDisk">
@@ -350,7 +349,7 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') drawer(false
 // ---------- 模型选择 / 管理 ----------
 let lastModelsKey = '';
 function renderModels(s) {
-  const key = JSON.stringify([s.models, s.sel, s.engine, s.turbo]);
+  const key = JSON.stringify([s.models, s.sel, s.engine]);
   if (key === lastModelsKey) return;
   lastModelsKey = key;
   for (const role of ['dit', 'te', 'vae', 'vision', 'mlx']) {
@@ -364,7 +363,6 @@ function renderModels(s) {
   $('sel_lora').innerHTML = '<option value="">不用</option>'
     + loras.map(m => `<option value="${esc(m.file)}" ${m.file === s.sel.lora ? 'selected' : ''}>${esc(m.file)}</option>`).join('');
   $('sel_lora').disabled = !loras.length;
-  lockTurbo(s.sel.engine !== 'mlx' && s.turbo);
   $('engineState').textContent = (s.engine ? 'sd.cpp ✓' : 'sd.cpp 未安装') + ' · ' + (s.mlx_engine ? 'MLX ✓' : 'MLX 未安装');
   const mlx = s.sel.engine === 'mlx';
   document.querySelectorAll('#engineSeg button').forEach(b => b.classList.toggle('on', b.dataset.e === s.sel.engine));
@@ -398,26 +396,6 @@ document.querySelectorAll('#engineSeg button').forEach(b => b.onclick = async ()
 ['dit', 'te', 'vae', 'vision', 'lora', 'mlx'].forEach(role => $('sel_' + role).onchange = async e => {
   await api('/api/select', {role, file: e.target.value}); lastModelsKey = ''; poll();
 });
-
-// 蒸馏加速 LoRA 自带步数、不开 CFG：锁住相关输入，框里显示实际用的值，解锁时还原用户原来填的
-const turboFields = [['steps', 'value'], ['cfg', 'value'], ['negative', 'value'], ['fast', 'checked']];
-function lockTurbo(n) {
-  const locked = $('steps').disabled;
-  if (!!n === locked && (!n || $('steps').value == n)) return;
-  const forced = {steps: n, cfg: '1', negative: '', fast: false};
-  for (const [id, prop] of turboFields) {
-    const el = $(id);
-    if (n && !locked) el._keep = el[prop];
-    el[prop] = n ? forced[id] : el._keep ?? el[prop];
-    el.disabled = !!n;
-  }
-  $('negative').placeholder = n ? '反向提示词（加速 LoRA 下不生效）' : '反向提示词（可选，CFG > 1 时生效）';
-  document.querySelectorAll('[data-lock]').forEach(e => e.hidden = !n);
-  $('turboHint').hidden = !n;
-  $('turboHint').textContent = n ? `正在用加速 LoRA：固定 ${n} 步、CFG 1，反向提示词和 EasyCache 不生效。想自己调，把 LoRA 换成「不用」。` : '';
-}
-// 锁定时往输入框填值（如「复用参数」）要改的是解锁后还原的那份
-function setField(id, prop, v) { const el = $(id); if (el.disabled) el._keep = v; else el[prop] = v; }
 
 // ---------- 推荐预设 ----------
 let lastPresetsKey = '';
@@ -734,9 +712,9 @@ $('stopAll').onclick = async () => { await api('/api/cancel', {all: true}); poll
 
 $('reuse').onclick = () => {
   if (!current) return;
-  $('prompt').value = current.prompt; setField('negative', 'value', current.negative || '');
-  $('size').value = current.size; setField('steps', 'value', current.steps);
-  setField('cfg', 'value', String(current.cfg)); $('seed').value = current.seed; setField('fast', 'checked', !!current.fast);
+  $('prompt').value = current.prompt; $('negative').value = current.negative || '';
+  $('size').value = current.size; $('steps').value = current.steps;
+  $('cfg').value = String(current.cfg); $('seed').value = current.seed; $('fast').checked = !!current.fast;
 };
 $('asRef').onclick = async () => {
   if (!current) return;

@@ -10,7 +10,6 @@
 - **两个引擎**：[stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)（默认，功能全）和 [MLX-Serve](https://github.com/ddalcu/mlx-serve)（实验，文生图更快）
 - **模型管理**：贴链接下载任意模型（单个文件或整个 Hugging Face 仓库），断点续传，可切换国内镜像；自带推荐预设
 - **切换模型**：生图模型、文本编码器、VAE、视觉组件、LoRA 各自可选，方便对比 Q4 / Q8 等不同量化
-- **6 步加速**：可选 Viggle Turbo 蒸馏 LoRA，自动套用它训练时的 sigma 节点，12 步的活 6 步干完
 - **历史记录**：胶片条浏览、复用参数、当参考图继续改、删除（移到废纸篓）
 - **零依赖**：后端只用 Python 标准库，界面是系统自带的 WebKit，不需要 pip / npm / Chrome
 
@@ -71,7 +70,7 @@ python3 app.py      # 会自动打开 http://127.0.0.1:7861
 | `qwen_image_2.1_vae_bf16.safetensors` | VAE | 0.7 GB |
 | `mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf` | 视觉组件（指令编辑需要） | 0.75 GB |
 
-想更快，再点 **Viggle Turbo 6 步加速**（680 MB），然后在左侧「LoRA」里选上它。之前装过旧版 sd.cpp 的，先点一次 **更新 sd.cpp 程序**（旧版加载不全 Qwen 2.1 的 LoRA）。
+之前装过旧版 sd.cpp 的，先点一次 **更新 sd.cpp 程序**。想用 LoRA 就把文件放进 `models/`（或贴链接下载），在左侧「LoRA」里选上。
 
 也可以把任意下载链接贴进「添加下载」：单个文件链接、`/blob/` 页面链接、或整个 Hugging Face 仓库地址都行。下载源可选 Hugging Face 原站（走系统代理）或国内镜像 hf-mirror。关掉工具后，未完成的任务下次打开会自动续传。
 
@@ -83,8 +82,7 @@ python3 app.py      # 会自动打开 http://127.0.0.1:7861
 
 | 场景 | 建议 |
 |---|---|
-| 日常出图 | 512×512 或 512×768，**12 步**，CFG 1，不开加速；或选上 Turbo LoRA，固定 6 步 |
-| Turbo LoRA | 步数、CFG 自动锁定（6 步、CFG 1），反向提示词和 EasyCache 不生效；构图和原模型基本一致，细微纹理会差一点 |
+| 日常出图 | 512×512 或 512×768，**12 步**，CFG 1，不开加速 |
 | 定稿 | 20 步以上；想要手部、文字更好用 CFG 3（时间翻倍）并填反向提示词 |
 | 写实人像的手 | CFG 3 + 反向提示词「畸形的手, 多余的手指, 手指粘连」；Q8 模型更好 |
 | 文本编码器放磁盘 | **默认关闭**。关着时所有权重都零拷贝映射，内存紧张由系统按需丢页；只有生成时报内存不足才开，代价是每张图多等约一分钟重读文本编码器 |
@@ -102,7 +100,7 @@ python3 app.py      # 会自动打开 http://127.0.0.1:7861
 
 CFG 大于 1 时每步要算两遍，时间约翻倍。Qwen-Image 2.1 官方默认就是不开 CFG（= 1）；注意 CFG 填 0 不是「关闭」，按公式会只剩无条件分支、完全无视提示词。
 
-上表是旧版 sd.cpp（master-900）的数据，Turbo LoRA 和新版引擎的速度还没在 16 GB 机器上重测。
+上表是旧版 sd.cpp（master-900）的数据，新版引擎的速度还没在 16 GB 机器上重测。
 
 ## 排队连出
 
@@ -161,4 +159,3 @@ outputs/          生成的图片
 - [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp) 与 [leejet/Qwen-Image-2.1-GGUF](https://huggingface.co/leejet/Qwen-Image-2.1-GGUF)
 - [MLX-Serve](https://github.com/ddalcu/mlx-serve) 与 [ddalcu/Qwen-Image-2.1-MLX-Serve-4bit](https://huggingface.co/ddalcu/Qwen-Image-2.1-MLX-Serve-4bit)
 - [Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1)（VAE）
-- [Viggle/Qwen-Image-2.1-viggle-turbo](https://huggingface.co/Viggle/Qwen-Image-2.1-viggle-turbo)（6 步加速 LoRA）

@@ -151,15 +151,12 @@ class Engine:
 
 
 def body_for(sel, lora=True, steps=12, cache="disabled"):
-    nodes = app.turbo_nodes(sel["lora"]) if lora else None
     b = {"prompt": args.prompt, "negative_prompt": "", "width": W, "height": H, "seed": SEED, "output_format": "png",
-         "sample_params": {"sample_method": "euler", "sample_steps": len(nodes) if nodes else steps,
+         "sample_params": {"sample_method": "euler", "sample_steps": steps,
                            "guidance": {"txt_cfg": 1.0}},
          "cache_mode": cache}
     if lora and sel["lora"]:
         b["lora"] = [{"path": sel["lora"], "multiplier": 1.0}]
-    if nodes:
-        b["sample_params"]["custom_sigmas"] = app.turbo_sigmas(nodes, W, H)
     return b
 
 
