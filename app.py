@@ -3,7 +3,6 @@
 
 import base64
 import json
-import math
 import os
 import re
 import shutil
@@ -53,10 +52,7 @@ PRESETS = [
          {"role": "te", "url": f"{HF}/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/main/Qwen3VL-8B-Instruct-Q4_K_M.gguf"},
          {"role": "vision", "url": f"{HF}/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/main/mmproj-Qwen3VL-8B-Instruct-Q8_0.gguf"},
      ]},
-    {"name": "Viggle Turbo 6 步加速", "desc": "蒸馏 LoRA 680 MB，6 步出图、不用 CFG，文生图和指令编辑都能用",
-     "items": [{"role": "lora", "url": f"{HF}/Viggle/Qwen-Image-2.1-viggle-turbo/resolve/main/"
-                                       "Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128.safetensors"}]},
-    {"name": "更新 sd.cpp 程序", "desc": "装过旧版的点这个：带 prefix cache、修正采样调度和 VAE，LoRA 需要新版",
+    {"name": "更新 sd.cpp 程序", "desc": "装过旧版的点这个：带 prefix cache、修正采样调度和 VAE，Qwen 2.1 的 LoRA 也要新版才加载得全",
      "items": [{"role": "engine", "url": SD_ENGINE}]},
     {"name": "生图模型 Q8_0（高质量）", "desc": "7.7 GB，细节和手部更好，多占约 3 GB 内存",
      "items": [{"role": "dit", "url": f"{HF}/leejet/Qwen-Image-2.1-GGUF/resolve/main/qwen_image_2.1-Q8_0.gguf"}]},
@@ -1016,23 +1012,6 @@ def mlx_worker(record, pack):
 
 # ---------- 生成 ----------
 
-# 蒸馏加速 LoRA 训练时用的 sigma 节点：文件名含 key 的 LoRA 固定按这些节点采样、不开 CFG
-TURBO = {"viggle-turbo-v0.2.1-6step": [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25]}
-
-
-def turbo_nodes(lora):
-    n = Path(lora or "").name.lower()
-    return next((v for k, v in TURBO.items() if k in n), None)
-
-
-def turbo_sigmas(nodes, w, h):
-    """按分辨率做 Qwen 2.1 的 flow shift（与 sd.cpp 默认调度同一公式，但不做 terminal shift），末尾补 0。"""
-    seq = (w // 16) * (h // 16)
-    mu = 0.5 + (0.9 - 0.5) / (8192 - 256) * (seq - 256)
-    shift = lambda t: 1.0 if t >= 1 else math.exp(mu) / (math.exp(mu) + (1 / t - 1))
-    return [round(shift(t), 6) for t in nodes] + [0.0]
-
-
 def parse_params(req):
     """校验并解析生成参数（提示词另外处理）；出错抛 ValueError。种子 -1 表示每张随机。"""
     try:
@@ -1123,12 +1102,8 @@ def build_items(req):
 
 
 def run_sd(it):
-    sel, prm = it["sel"], dict(it)
+    sel, prm = it["sel"], it
     fast = prm["fast"]
-    nodes = turbo_nodes(sel["lora"])
-    if nodes:  # 蒸馏过的 LoRA：步数、CFG 由它决定，反向提示词和 EasyCache 都用不上
-        prm.update(steps=len(nodes), cfg=1.0, negative="")
-        fast = False
     stamp, out = out_path()
     body = {"prompt": prm["prompt"], "negative_prompt": prm["negative"], "width": prm["w"], "height": prm["h"],
             "seed": prm["seed"], "output_format": "png",
@@ -1143,8 +1118,6 @@ def run_sd(it):
         body["cache_option"] = f"threshold={1.0 / prm['steps']:.4f},start=0.2,end=0.9"
     if sel["lora"]:
         body["lora"] = [{"path": sel["lora"], "multiplier": 1.0}]
-    if nodes:
-        body["sample_params"]["custom_sigmas"] = turbo_sigmas(nodes, prm["w"], prm["h"])
     if prm["ref"]:
         body["ref_images"] = [base64.b64encode(prm["ref"][1]).decode()]
     record = {"file": str(out), "name": out.name, "prompt": prm["prompt"], "negative": prm["negative"],
@@ -1286,7 +1259,6 @@ def status():
         "mlx_engine": bool(mlx_serve()),
         "models": inv,
         "sel": (sel := selection(inv)),
-        "turbo": len(turbo_nodes(sel["lora"]) or []),
         "tasks": task_view(),
         "presets": preset_view(sel, tasks()),
         "job": {k: job[k] for k in ("running", "stage", "step", "total", "spi", "error", "output")}
