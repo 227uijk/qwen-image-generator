@@ -88,6 +88,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKScript
     }
 
     func stopServer() {
+        // 只关自己拉起的后端：server 进程已经退出了（比如端口被占、连上的是旧实例）时
+        // 不要 POST /api/quit，否则会把别人正在用的那个后台服务一起关掉
+        guard let p = server, p.isRunning else { return }
         var req = URLRequest(url: url.appendingPathComponent("api/quit"))
         req.httpMethod = "POST"
         req.httpBody = "{}".data(using: .utf8)
@@ -95,7 +98,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKScript
         let sem = DispatchSemaphore(value: 0)
         URLSession.shared.dataTask(with: req) { _, _, _ in sem.signal() }.resume()
         _ = sem.wait(timeout: .now() + 2)
-        if let p = server, p.isRunning {
+        if p.isRunning {
             p.waitUntilExit(timeout: 3)
             if p.isRunning { p.terminate() }
         }

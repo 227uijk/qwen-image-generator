@@ -348,6 +348,7 @@ def run_task(t):
         return
     cmd = curl_base(proxy) + ["-C", "-", "--retry", "20", "--retry-delay", "3", "--retry-all-errors",
                               "-o", str(part), url]
+    fails = 0  # 外层轮次：curl 自己的 20 次重试全失败算一轮；断网这类问题别无限重试
     while True:
         cur = next((x for x in tasks() if x["id"] == t["id"]), None)
         if not cur or cur["status"] != "downloading":  # 重试等待期间被暂停或移除
@@ -370,6 +371,11 @@ def run_task(t):
         fatal = re.search(r"error: (401|403|404)", err or "") if p.returncode == 22 else None
         if fatal:
             update_task(t["id"], status="error", error=http_error(fatal[1]))
+            return
+        fails += 1
+        if fails >= 5:
+            update_task(t["id"], status="error",
+                        error=(err or "").strip()[-200:] or f"curl 退出码 {p.returncode}，多次重试后放弃")
             return
         update_task(t["id"], error=(err or "").strip()[-200:] or f"curl 退出码 {p.returncode}，重试中…")
         time.sleep(5)
@@ -1328,6 +1334,8 @@ class H(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         try:
             n = int(self.headers.get("Content-Length") or 0)
+            if n > 64 * 2**20:  # 参考图 base64 顶多数 MB，64 MB 已经很宽裕
+                return self.send(413, {"error": "请求体太大"})
             req = json.loads(self.rfile.read(n) or b"{}")
             if path == "/api/generate":
                 err = start_generate(req)

@@ -713,8 +713,14 @@ $('stopAll').onclick = async () => { await api('/api/cancel', {all: true}); poll
 $('reuse').onclick = () => {
   if (!current) return;
   $('prompt').value = current.prompt; $('negative').value = current.negative || '';
-  $('size').value = current.size; $('steps').value = current.steps;
-  $('cfg').value = String(current.cfg); $('seed').value = current.seed; $('fast').checked = !!current.fast;
+  // 历史里的值可能不在下拉选项里（比如以后改了选项列表）：补一个临时选项，不然会被清空
+  for (const [id, val] of [['size', current.size], ['cfg', String(current.cfg)]]) {
+    if (val && ![...$(id).options].some(o => o.value === val))
+      $(id).append(new Option(val.replace('x', ' × '), val));
+    if (val) $(id).value = val;
+  }
+  $('steps').value = current.steps;
+  $('seed').value = current.seed; $('fast').checked = !!current.fast;
 };
 $('asRef').onclick = async () => {
   if (!current) return;
