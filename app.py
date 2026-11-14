@@ -534,6 +534,23 @@ def sd_commit():
     return _commit_cache[key]
 
 
+_lib_feat = {}
+
+
+def sd_has(token):
+    """正在用的 sd.cpp 支不支持某个功能：查 dylib 里有没有对应的参数字符串。
+    初代自带的 master-900 还没有 prefix cache，传了不认识的 --model-args 键会启动失败。"""
+    exe = sd_server()
+    lib = exe and exe.parent / "libstable-diffusion.dylib"
+    if not lib or not lib.exists():
+        return False
+    key = (str(lib), lib.stat().st_mtime, token)
+    if key not in _lib_feat:
+        _lib_feat.clear()
+        _lib_feat[key] = token in lib.read_bytes()
+    return _lib_feat[key]
+
+
 def program_installed(it):
     if it["role"] == "mlx_engine":
         return bool(mlx_serve())
@@ -760,11 +777,12 @@ def ensure_sd(sel, te_disk, warm=False):
              "--lora-model-dir", str(MODELS),
              # 权重直接映射成 Metal buffer（零拷贝），不再在内存里另存一份；映射失败时 sd.cpp 自动回退为普通加载
              "--mmap",
-             # Qwen 2.1 的 prefix cache：同一条件（提示词 + 参考图）的 K/V 跨步复用，编辑场景重复出图更快；
-             # q8_0 把缓存压到 8bit，16 GB 机器上编辑大图时省内存
-             "--model-args", "qwen_image_2_1_prefix_cache_type=q8_0",
              # Qwen 2.1 的 VAE 是 3D 卷积，M2 上 Metal 实现很慢，放 CPU 快 3 倍且结果一致
              "--backend", "vae=cpu"]
+        # Qwen 2.1 的 prefix cache：同一条件（提示词 + 参考图）的 K/V 跨步复用，编辑场景重复出图更快；
+        # q8_0 把缓存压到 8bit，16 GB 机器上编辑大图时省内存。老引擎不认这个键，不传
+        if sd_has(b"qwen_image_2_1_prefix_cache_type"):
+            a += ["--model-args", "qwen_image_2_1_prefix_cache_type=q8_0"]
         if sel["vision"]:  # 权重按需加载，不放参考图时不占内存
             a += ["--llm_vision", str(MODELS / sel["vision"])]
         if te_disk:  # 文本编码器不映射，每张图用 read() 读进来、用完释放（慢，只给真爆内存时兜底）
@@ -1355,7 +1373,7 @@ class H(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         try:
             n = int(self.headers.get("Content-Length") or 0)
-            if n > 64 * 2**20:  # 参考图 base64 顶多数 MB，64 MB 已经很宽裕
+            if n < 0 or n > 64 * 2**20:  # 参考图 base64 顶多数 MB，64 MB 已经很宽裕
                 return self.send(413, {"error": "请求体太大"})
             req = json.loads(self.rfile.read(n) or b"{}")
             if path == "/api/generate":
