@@ -41,8 +41,9 @@ MODEL_EXT = (".gguf", ".safetensors")
 
 # 推荐预设：只是帮忙填好链接，用户也可以自己贴任意链接
 HF = "https://huggingface.co"
+# master-1097 起带 custom_sigmas 和 qwen-image-2.1-turbo 排程（Turbo 模型必需）
 SD_ENGINE = ("https://github.com/leejet/stable-diffusion.cpp/releases/download/"
-             "master-920-2f88688/sd-master-2f88688-bin-Darwin-macOS-26.6.2-arm64.zip")
+             "master-1097-4b51674/sd-master-4b51674-bin-Darwin-macOS-26.7.2-arm64.zip")
 PRESETS = [
     {"name": "Qwen-Image 2.1 基础套装", "desc": "sd.cpp 程序 + 4bit 模型 + VAE + 视觉组件，约 10.7 GB，16 GB Mac 可用",
      "items": [
@@ -58,6 +59,10 @@ PRESETS = [
      "items": [{"role": "dit", "url": f"{HF}/leejet/Qwen-Image-2.1-GGUF/resolve/main/qwen_image_2.1-Q8_0.gguf"}]},
     {"name": "生图模型 Q6_K", "desc": "6.0 GB，介于 Q4 和 Q8 之间",
      "items": [{"role": "dit", "url": f"{HF}/leejet/Qwen-Image-2.1-GGUF/resolve/main/qwen_image_2.1-Q6_K.gguf"}]},
+    {"name": "Qwen-Image 2.1 Turbo（8 步极速）", "desc": "蒸馏版生图模型，8 步出图约快 3 倍，只补 3.8 GB，其余组件和基础套装共用",
+     "items": [{"role": "dit", "url": f"{HF}/DogukanUrker/Qwen-Image-2.1-Turbo-GGUF/resolve/main/qwen-image-2.1-turbo-Q4_K_S.gguf"}]},
+    {"name": "Turbo 模型 Q6_K（高质量）", "desc": "5.5 GB，8 步蒸馏版的更高保真量化",
+     "items": [{"role": "dit", "url": f"{HF}/DogukanUrker/Qwen-Image-2.1-Turbo-GGUF/resolve/main/qwen-image-2.1-turbo-Q6_K.gguf"}]},
     {"name": "Heretic 文本编码器", "desc": "去除拒答倾向的 Qwen3-VL，含配套视觉组件，约 6.2 GB",
      "items": [
          {"role": "te", "url": f"{HF}/pottokao/Qwen-Image-2.1-Text-Encoder-Heretic-GGUF/resolve/main/qwen3vl_8b_heretic-Q4_K_M.gguf"},
@@ -348,6 +353,7 @@ def run_task(t):
         return
     cmd = curl_base(proxy) + ["-C", "-", "--retry", "20", "--retry-delay", "3", "--retry-all-errors",
                               "-o", str(part), url]
+    fails = 0  # 外层轮次：curl 自己的 20 次重试全失败算一轮；断网这类问题别无限重试
     while True:
         cur = next((x for x in tasks() if x["id"] == t["id"]), None)
         if not cur or cur["status"] != "downloading":  # 重试等待期间被暂停或移除
@@ -370,6 +376,11 @@ def run_task(t):
         fatal = re.search(r"error: (401|403|404)", err or "") if p.returncode == 22 else None
         if fatal:
             update_task(t["id"], status="error", error=http_error(fatal[1]))
+            return
+        fails += 1
+        if fails >= 5:
+            update_task(t["id"], status="error",
+                        error=(err or "").strip()[-200:] or f"curl 退出码 {p.returncode}，多次重试后放弃")
             return
         update_task(t["id"], error=(err or "").strip()[-200:] or f"curl 退出码 {p.returncode}，重试中…")
         time.sleep(5)
@@ -749,6 +760,9 @@ def ensure_sd(sel, te_disk, warm=False):
              "--lora-model-dir", str(MODELS),
              # 权重直接映射成 Metal buffer（零拷贝），不再在内存里另存一份；映射失败时 sd.cpp 自动回退为普通加载
              "--mmap",
+             # Qwen 2.1 的 prefix cache：同一条件（提示词 + 参考图）的 K/V 跨步复用，编辑场景重复出图更快；
+             # q8_0 把缓存压到 8bit，16 GB 机器上编辑大图时省内存
+             "--model-args", "qwen_image_2_1_prefix_cache_type=q8_0",
              # Qwen 2.1 的 VAE 是 3D 卷积，M2 上 Metal 实现很慢，放 CPU 快 3 倍且结果一致
              "--backend", "vae=cpu"]
         if sel["vision"]:  # 权重按需加载，不放参考图时不占内存
@@ -1084,6 +1098,9 @@ def build_items(req):
         imgs = [decode_ref(r) for r in refs]
     except ValueError as e:
         return str(e)
+    # Turbo 蒸馏版的调度要求尺寸 32 对齐（sd.cpp 文档）
+    if not mlx and sel["dit"] and "turbo" in sel["dit"].lower() and (prm["w"] % 32 or prm["h"] % 32):
+        return "Turbo 模型要求尺寸是 32 的倍数"
     total = max(1, len(imgs)) * len(prompts) * prm["count"]
     if len(queue) + total > MAX_QUEUE:
         return f"一次排太多了（{total} 张），队列最多 {MAX_QUEUE} 张"
@@ -1101,16 +1118,26 @@ def build_items(req):
     return items
 
 
+# Turbo 蒸馏版（Qwen-Image 2.1 Turbo）的固定 8 步排程，和 --sigmas qwen-image-2.1-turbo 一致；
+# sigma 数减一决定步数，末尾的 0 必须带上
+TURBO_SIGMAS = [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568, 0.0]
+
+
 def run_sd(it):
     sel, prm = it["sel"], it
-    fast = prm["fast"]
+    turbo = "turbo" in Path(sel["dit"]).name.lower()
+    fast = prm["fast"] and not turbo  # Turbo 只有 8 步，再跳步画质损失明显，加速开关对它无效
+    # Turbo 的步数 / CFG 由蒸馏排程定死，历史和「复用参数」要记实际值
+    steps, cfg = (len(TURBO_SIGMAS) - 1, 1.0) if turbo else (prm["steps"], prm["cfg"])
     stamp, out = out_path()
     body = {"prompt": prm["prompt"], "negative_prompt": prm["negative"], "width": prm["w"], "height": prm["h"],
             "seed": prm["seed"], "output_format": "png",
-            "sample_params": {"sample_method": "euler", "sample_steps": prm["steps"],
-                              "guidance": {"txt_cfg": prm["cfg"]}},
+            "sample_params": {"sample_method": "euler", "sample_steps": steps,
+                              "guidance": {"txt_cfg": cfg}},
             # EasyCache：相邻步变化小时跳过计算
             "cache_mode": "easycache" if fast else "disabled"}
+    if turbo:
+        body["sample_params"]["custom_sigmas"] = TURBO_SIGMAS
     if fast:
         # sd.cpp 默认阈值 0.2 是累计变化量：步数越多每步变化越小、跳得越多，20 步跳 11 步，
         # 40 步实际算的步数也差不多，画质反而不如不加速。阈值按步数反比缩放，跳过的比例就大致固定（估算
@@ -1121,7 +1148,7 @@ def run_sd(it):
     if prm["ref"]:
         body["ref_images"] = [base64.b64encode(prm["ref"][1]).decode()]
     record = {"file": str(out), "name": out.name, "prompt": prm["prompt"], "negative": prm["negative"],
-              "size": prm["size"], "steps": prm["steps"], "cfg": prm["cfg"], "seed": prm["seed"],
+              "size": prm["size"], "steps": steps, "cfg": cfg, "seed": prm["seed"], "turbo": turbo,
               "ref": bool(prm["ref"]), "fast": fast, "time": stamp, "dit": Path(sel["dit"]).name,
               "te": Path(sel["te"]).name, "lora": Path(sel["lora"]).stem if sel["lora"] else None}
     sd_worker(sel, it["te_disk"], body, record)
@@ -1328,6 +1355,8 @@ class H(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         try:
             n = int(self.headers.get("Content-Length") or 0)
+            if n > 64 * 2**20:  # 参考图 base64 顶多数 MB，64 MB 已经很宽裕
+                return self.send(413, {"error": "请求体太大"})
             req = json.loads(self.rfile.read(n) or b"{}")
             if path == "/api/generate":
                 err = start_generate(req)
