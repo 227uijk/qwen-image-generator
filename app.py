@@ -1127,17 +1127,17 @@ def run_sd(it):
     sel, prm = it["sel"], it
     turbo = "turbo" in Path(sel["dit"]).name.lower()
     fast = prm["fast"] and not turbo  # Turbo 只有 8 步，再跳步画质损失明显，加速开关对它无效
+    # Turbo 的步数 / CFG 由蒸馏排程定死，历史和「复用参数」要记实际值
+    steps, cfg = (len(TURBO_SIGMAS) - 1, 1.0) if turbo else (prm["steps"], prm["cfg"])
     stamp, out = out_path()
     body = {"prompt": prm["prompt"], "negative_prompt": prm["negative"], "width": prm["w"], "height": prm["h"],
             "seed": prm["seed"], "output_format": "png",
-            "sample_params": {"sample_method": "euler", "sample_steps": prm["steps"],
-                              "guidance": {"txt_cfg": prm["cfg"]}},
+            "sample_params": {"sample_method": "euler", "sample_steps": steps,
+                              "guidance": {"txt_cfg": cfg}},
             # EasyCache：相邻步变化小时跳过计算
             "cache_mode": "easycache" if fast else "disabled"}
     if turbo:
         body["sample_params"]["custom_sigmas"] = TURBO_SIGMAS
-        body["sample_params"]["sample_steps"] = len(TURBO_SIGMAS) - 1
-        body["sample_params"]["guidance"]["txt_cfg"] = 1.0  # 蒸馏版按 CFG 1 训练，反向提示词不参与
     if fast:
         # sd.cpp 默认阈值 0.2 是累计变化量：步数越多每步变化越小、跳得越多，20 步跳 11 步，
         # 40 步实际算的步数也差不多，画质反而不如不加速。阈值按步数反比缩放，跳过的比例就大致固定（估算
@@ -1148,7 +1148,7 @@ def run_sd(it):
     if prm["ref"]:
         body["ref_images"] = [base64.b64encode(prm["ref"][1]).decode()]
     record = {"file": str(out), "name": out.name, "prompt": prm["prompt"], "negative": prm["negative"],
-              "size": prm["size"], "steps": prm["steps"], "cfg": prm["cfg"], "seed": prm["seed"],
+              "size": prm["size"], "steps": steps, "cfg": cfg, "seed": prm["seed"], "turbo": turbo,
               "ref": bool(prm["ref"]), "fast": fast, "time": stamp, "dit": Path(sel["dit"]).name,
               "te": Path(sel["te"]).name, "lora": Path(sel["lora"]).stem if sel["lora"] else None}
     sd_worker(sel, it["te_disk"], body, record)

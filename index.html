@@ -618,7 +618,7 @@ function show(h) {
     .filter(([k]) => t[k] >= 0.5).map(([k, n]) => `${n} ${Math.round(t[k])}s`);
   $('infoMeta').textContent = `${h.size.replace('x', '×')} · ${h.steps}步 · CFG ${h.cfg}`
     + (h.seconds ? ` · ${fmt(h.seconds)}` + (parts.length ? `（${parts.join(' · ')}）` : '') : '')
-    + (h.fast ? ' · 加速' : '') + (h.ref ? ' · 图生图' : '') + (h.engine === 'mlx' ? ' · MLX' : '') + (h.lora ? ` · ${h.lora}` : '') + (h.dit ? ` · ${h.dit.replace(/\.(gguf|safetensors)$/, '')}` : '');
+    + (h.turbo ? ' · Turbo' : '') + (h.fast ? ' · 加速' : '') + (h.ref ? ' · 图生图' : '') + (h.engine === 'mlx' ? ' · MLX' : '') + (h.lora ? ` · ${h.lora}` : '') + (h.dit ? ` · ${h.dit.replace(/\.(gguf|safetensors)$/, '')}` : '');
   $('infoMeta').title = `种子 ${h.seed}` + (h.te ? `\n文本编码器 ${h.te}` : '');
   $('history').querySelectorAll('img').forEach(img => {
     const on = history[img.dataset.i] === h;
