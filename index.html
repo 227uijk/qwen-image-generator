@@ -367,9 +367,11 @@ function renderModels(s) {
   const mlx = s.sel.engine === 'mlx';
   document.querySelectorAll('#engineSeg button').forEach(b => b.classList.toggle('on', b.dataset.e === s.sel.engine));
   $('sdSel').hidden = mlx; $('mlxSel').hidden = !mlx;
+  const turbo = !mlx && (s.sel.dit || '').toLowerCase().includes('turbo');
   $('engineHint').textContent = mlx
     ? (s.mlx_engine ? 'MLX 引擎：苹果 MLX 框架，不支持参考图；磁盘模式 / 加速开关对它无效。' : 'MLX-Serve 程序还没装，去「管理」下载「MLX 引擎套装」。')
     : !s.engine ? 'sd.cpp 程序还没装，去「管理」下载「基础套装」。'
+    : turbo ? 'Turbo 蒸馏版：固定 8 步 + CFG 1，步数 / CFG / 加速开关不生效，反向提示词不参与。'
     : '';
   const order = ['dit', 'te', 'vae', 'vision', 'lora', 'mlx', 'other'];
   const roleOpts = cur => order.map(r => `<option value="${r}" ${r === cur ? 'selected' : ''}>${esc(meta.roles[r] || r)}</option>`).join('');

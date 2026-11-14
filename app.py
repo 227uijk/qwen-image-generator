@@ -58,6 +58,10 @@ PRESETS = [
      "items": [{"role": "dit", "url": f"{HF}/leejet/Qwen-Image-2.1-GGUF/resolve/main/qwen_image_2.1-Q8_0.gguf"}]},
     {"name": "生图模型 Q6_K", "desc": "6.0 GB，介于 Q4 和 Q8 之间",
      "items": [{"role": "dit", "url": f"{HF}/leejet/Qwen-Image-2.1-GGUF/resolve/main/qwen_image_2.1-Q6_K.gguf"}]},
+    {"name": "Qwen-Image 2.1 Turbo（8 步极速）", "desc": "蒸馏版生图模型，8 步出图约快 3 倍，只补 3.8 GB，其余组件和基础套装共用",
+     "items": [{"role": "dit", "url": f"{HF}/DogukanUrker/Qwen-Image-2.1-Turbo-GGUF/resolve/main/qwen-image-2.1-turbo-Q4_K_S.gguf"}]},
+    {"name": "Turbo 模型 Q6_K（高质量）", "desc": "5.5 GB，8 步蒸馏版的更高保真量化",
+     "items": [{"role": "dit", "url": f"{HF}/DogukanUrker/Qwen-Image-2.1-Turbo-GGUF/resolve/main/qwen-image-2.1-turbo-Q6_K.gguf"}]},
     {"name": "Heretic 文本编码器", "desc": "去除拒答倾向的 Qwen3-VL，含配套视觉组件，约 6.2 GB",
      "items": [
          {"role": "te", "url": f"{HF}/pottokao/Qwen-Image-2.1-Text-Encoder-Heretic-GGUF/resolve/main/qwen3vl_8b_heretic-Q4_K_M.gguf"},
@@ -1090,6 +1094,9 @@ def build_items(req):
         imgs = [decode_ref(r) for r in refs]
     except ValueError as e:
         return str(e)
+    # Turbo 蒸馏版的调度要求尺寸 32 对齐（sd.cpp 文档）
+    if not mlx and sel["dit"] and "turbo" in sel["dit"].lower() and (prm["w"] % 32 or prm["h"] % 32):
+        return "Turbo 模型要求尺寸是 32 的倍数"
     total = max(1, len(imgs)) * len(prompts) * prm["count"]
     if len(queue) + total > MAX_QUEUE:
         return f"一次排太多了（{total} 张），队列最多 {MAX_QUEUE} 张"
@@ -1107,9 +1114,15 @@ def build_items(req):
     return items
 
 
+# Turbo 蒸馏版（Qwen-Image 2.1 Turbo）的固定 8 步排程，和 --sigmas qwen-image-2.1-turbo 一致；
+# sigma 数减一决定步数，末尾的 0 必须带上
+TURBO_SIGMAS = [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568, 0.0]
+
+
 def run_sd(it):
     sel, prm = it["sel"], it
-    fast = prm["fast"]
+    turbo = "turbo" in Path(sel["dit"]).name.lower()
+    fast = prm["fast"] and not turbo  # Turbo 只有 8 步，再跳步画质损失明显，加速开关对它无效
     stamp, out = out_path()
     body = {"prompt": prm["prompt"], "negative_prompt": prm["negative"], "width": prm["w"], "height": prm["h"],
             "seed": prm["seed"], "output_format": "png",
@@ -1117,6 +1130,10 @@ def run_sd(it):
                               "guidance": {"txt_cfg": prm["cfg"]}},
             # EasyCache：相邻步变化小时跳过计算
             "cache_mode": "easycache" if fast else "disabled"}
+    if turbo:
+        body["sample_params"]["custom_sigmas"] = TURBO_SIGMAS
+        body["sample_params"]["sample_steps"] = len(TURBO_SIGMAS) - 1
+        body["sample_params"]["guidance"]["txt_cfg"] = 1.0  # 蒸馏版按 CFG 1 训练，反向提示词不参与
     if fast:
         # sd.cpp 默认阈值 0.2 是累计变化量：步数越多每步变化越小、跳得越多，20 步跳 11 步，
         # 40 步实际算的步数也差不多，画质反而不如不加速。阈值按步数反比缩放，跳过的比例就大致固定（估算
