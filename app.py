@@ -41,8 +41,9 @@ MODEL_EXT = (".gguf", ".safetensors")
 
 # 推荐预设：只是帮忙填好链接，用户也可以自己贴任意链接
 HF = "https://huggingface.co"
+# master-1097 起带 custom_sigmas 和 qwen-image-2.1-turbo 排程（Turbo 模型必需）
 SD_ENGINE = ("https://github.com/leejet/stable-diffusion.cpp/releases/download/"
-             "master-920-2f88688/sd-master-2f88688-bin-Darwin-macOS-26.6.2-arm64.zip")
+             "master-1097-4b51674/sd-master-4b51674-bin-Darwin-macOS-26.7.2-arm64.zip")
 PRESETS = [
     {"name": "Qwen-Image 2.1 基础套装", "desc": "sd.cpp 程序 + 4bit 模型 + VAE + 视觉组件，约 10.7 GB，16 GB Mac 可用",
      "items": [
