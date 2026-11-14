@@ -760,6 +760,9 @@ def ensure_sd(sel, te_disk, warm=False):
              "--lora-model-dir", str(MODELS),
              # 权重直接映射成 Metal buffer（零拷贝），不再在内存里另存一份；映射失败时 sd.cpp 自动回退为普通加载
              "--mmap",
+             # Qwen 2.1 的 prefix cache：同一条件（提示词 + 参考图）的 K/V 跨步复用，编辑场景重复出图更快；
+             # q8_0 把缓存压到 8bit，16 GB 机器上编辑大图时省内存
+             "--model-args", "qwen_image_2_1_prefix_cache_type=q8_0",
              # Qwen 2.1 的 VAE 是 3D 卷积，M2 上 Metal 实现很慢，放 CPU 快 3 倍且结果一致
              "--backend", "vae=cpu"]
         if sel["vision"]:  # 权重按需加载，不放参考图时不占内存
